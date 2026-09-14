@@ -8,6 +8,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.core.database import create_db_engine, get_session
 from app.main import create_app
+from app.models import Base
 
 
 @pytest.fixture
@@ -16,6 +17,7 @@ def engine() -> Iterator[Engine]:
     # hands out one shared connection, so the test and the app (which
     # TestClient runs on another thread) see the same data.
     engine = create_db_engine("sqlite://", poolclass=StaticPool)
+    Base.metadata.create_all(engine)
     yield engine
     engine.dispose()
 
