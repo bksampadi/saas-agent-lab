@@ -23,6 +23,9 @@ module-name = "app"
 [tool.ruff]
 line-length = 88
 target-version = "py312"
+# Tells the import sorter which packages are ours. Without this, the local
+# alembic/ migrations folder is mistaken for the alembic library.
+src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
