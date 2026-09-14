@@ -2,7 +2,7 @@
 name = "saas-agent-lab"
 version = "0.1.0"
 description = "A small B2B SaaS administration system: users, licences, assignments, audit log."
-readme = "CLAUDE.md"
+readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "alembic>=1.20.0",
