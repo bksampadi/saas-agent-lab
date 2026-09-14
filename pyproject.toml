@@ -1,0 +1,39 @@
+[project]
+name = "saas-agent-lab"
+version = "0.1.0"
+description = "A small B2B SaaS administration system: users, licences, assignments, audit log."
+readme = "CLAUDE.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "alembic>=1.20.0",
+    "fastapi>=0.141.1",
+    "pydantic>=2.13.5,<3",
+    "pydantic-settings>=2.15.0",
+    "sqlalchemy>=2.0.52,<3",
+    "uvicorn>=0.52.4",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.2,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "app"
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+    "ruff>=0.16.7",
+]
