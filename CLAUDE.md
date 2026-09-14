@@ -38,7 +38,7 @@ Rules: deactivating a user revokes all their active assignments. A licence with 
 
 ## Stack
 
-Python 3.12, uv, FastAPI, SQLAlchemy 2.x, Alembic, Pydantic v2, pydantic-settings, pytest, httpx (test client), ruff. Frontend: plain HTML/CSS/JS served from `static/`. No frontend framework in v0.1.
+Python 3.12, uv, FastAPI, SQLAlchemy 2.x, Alembic, Pydantic v2, pydantic-settings, pytest, httpx2 (test client), ruff. Frontend: plain HTML/CSS/JS served from `static/`. No frontend framework in v0.1.
 
 ## Commands
 
