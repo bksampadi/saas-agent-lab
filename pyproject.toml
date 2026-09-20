@@ -34,9 +34,15 @@ select = ["E", "F", "I", "B", "UP"]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers --import-mode=importlib"
 
+[tool.pyright]
+include = ["src", "tests"]
+typeCheckingMode = "basic"
+pythonVersion = "3.12"
+
 [dependency-groups]
 dev = [
     "httpx2>=2.12.0",
+    "pyright>=1.1.414",
     "pytest>=9.1.1",
     "ruff>=0.16.7",
 ]
