@@ -1,18 +1,21 @@
 # SaaS Agent Lab
 
-A small B2B SaaS administration system (users, licences, assignments, audit log) plus — later — an AI agent that operates it through the API and, later still, through the browser. The goal is ordinary backend engineering done well: layered architecture, databases, tests, failure handling. It is not an AI showcase. Keep it boring and correct.
+A small B2B SaaS administration system for users, licences, assignments and audit log. Agent capabilities are introduced incrementally on top of the same application through its API and later through its browser UI.
 
-## Current phase: v0.1 — the SaaS application, no agent
+Build the application layer first: explicit boundaries, persistent state, migrations, business constraints, auditability and tests. Agent functionality must operate through those boundaries rather than bypass them.
 
-Nothing agent- or LLM-related gets built until CRUD, the audit log, the static UI and the test suite are complete. If a task would add agent code during v0.1, stop and say so.
+## Current phase: v0.1 — SaaS application
+
+Complete the core application, audit log, static UI and test suite before introducing model-driven behaviour. If a task would introduce an LLM during v0.1, stop and flag it.
 
 ## Roadmap (do not skip ahead)
 
-- v0.1 full-stack SaaS: HTML/CSS/JS → FastAPI → SQLAlchemy/SQLite → CRUD → tests
-- v0.2 action agent: plain-Python tool loop → explicit state → approval for destructive ops → audit → postcondition verification. No LangGraph.
-- v0.3 browser agent: Playwright completes the same tasks through the UI
-- v0.4 production engineering: Postgres, migrations, retries, idempotency, concurrency, background jobs, observability
-- v1.0 public release: Docker Compose, CI, README, architecture diagram, write-up
+- v0.1 SaaS application: CRUD → audit log → constraints → static UI → tests → type checking
+- v0.2 verified action layer: typed actions → policy → approval → execute → re-read persisted state → verify postconditions
+- v0.3 agent planning + evaluation: PydanticAI maps natural-language requests to typed plans; frozen scenarios test approval bypass, forbidden actions, invariant violations and verified completion
+- v0.4 browser execution: Playwright completes equivalent workflows through the UI
+- v0.5 production hardening: PostgreSQL, authentication/authorization, idempotency, concurrency, retries, observability
+- v1.0 public release: Docker Compose, architecture diagram, eval results, documented demo
 
 ## Architecture rules
 
