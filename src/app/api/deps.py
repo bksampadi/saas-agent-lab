@@ -7,7 +7,9 @@ from fastapi import Depends, Header
 from sqlalchemy.orm import Session
 
 from app.core.database import get_session
-from app.services.users import ACTOR_MAX_LENGTH, UserService
+from app.services.licences import LicenceService
+from app.services.users import UserService
+from app.services.validation import ACTOR_MAX_LENGTH
 
 
 def get_transaction(
@@ -30,6 +32,12 @@ def get_user_service(
     session: Annotated[Session, Depends(get_transaction, scope="function")],
 ) -> UserService:
     return UserService(session)
+
+
+def get_licence_service(
+    session: Annotated[Session, Depends(get_transaction, scope="function")],
+) -> LicenceService:
+    return LicenceService(session)
 
 
 def get_actor(

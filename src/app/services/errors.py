@@ -19,3 +19,15 @@ class UserNotFound(DomainError):
     def __init__(self, user_id: int) -> None:
         super().__init__(f"User {user_id} not found.")
         self.user_id = user_id
+
+
+class ProductAlreadyExists(DomainError):
+    def __init__(self, product: str) -> None:
+        super().__init__(f"A licence for product {product!r} already exists.")
+        self.product = product
+
+
+class LicenceNotFound(DomainError):
+    def __init__(self, licence_id: int) -> None:
+        super().__init__(f"Licence {licence_id} not found.")
+        self.licence_id = licence_id

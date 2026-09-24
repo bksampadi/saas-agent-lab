@@ -14,11 +14,11 @@ from app.models import AuditEvent, User, UserStatus
 from app.repositories.audit_events import AuditEventRepository
 from app.repositories.users import UserRepository, is_duplicate_email
 from app.services.errors import EmailAlreadyExists, InvalidInput, UserNotFound
+from app.services.validation import required_text, validated_actor
 
-# Limits match the column sizes: users.email, users.name, audit_events.actor.
+# Limits match the column sizes: users.email, users.name.
 EMAIL_MAX_LENGTH = 320
 NAME_MAX_LENGTH = 200
-ACTOR_MAX_LENGTH = 320
 
 # Deliberately modest, not RFC validation: exactly one "@", something on each
 # side, no whitespace. Internal domains such as "ops@localhost" are allowed.
@@ -31,19 +31,10 @@ def normalize_email(email: str) -> str:
     return email.strip().lower()
 
 
-def _required_text(value: str, *, field: str, max_length: int) -> str:
-    stripped = value.strip()
-    if not stripped:
-        raise InvalidInput(f"{field} must not be empty.")
-    if len(stripped) > max_length:
-        raise InvalidInput(f"{field} must be at most {max_length} characters.")
-    return stripped
-
-
 def _validated_email(email: str) -> str:
     # Length is checked after normalizing, because that is what gets stored
     # (lowercasing can change a string's length).
-    normalized = _required_text(
+    normalized = required_text(
         normalize_email(email), field="Email", max_length=EMAIL_MAX_LENGTH
     )
     if _EMAIL_RE.fullmatch(normalized) is None:
@@ -64,8 +55,8 @@ class UserService:
     def create_user(self, *, email: str, name: str, actor: str) -> User:
         """Create an active user and its audit event in the caller's transaction."""
         email = _validated_email(email)
-        name = _required_text(name, field="Name", max_length=NAME_MAX_LENGTH)
-        actor = _required_text(actor, field="Actor", max_length=ACTOR_MAX_LENGTH)
+        name = required_text(name, field="Name", max_length=NAME_MAX_LENGTH)
+        actor = validated_actor(actor)
 
         if self._users.get_by_email(email) is not None:
             raise EmailAlreadyExists(email)
