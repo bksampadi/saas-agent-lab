@@ -6,7 +6,11 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.database import get_session
+from app.main import create_app
 from app.models import AuditEvent, User
+from app.repositories.audit_events import AuditEventRepository
+from app.repositories.users import UserRepository
 
 ACTOR_HEADERS = {"X-Actor": "admin@example.com"}
 
@@ -69,6 +73,77 @@ def test_create_user_with_duplicate_normalized_email_returns_409(
     }
     assert count(session, User) == 1
     assert count(session, AuditEvent) == 1
+
+
+def test_create_user_is_committed_by_the_request_transaction(
+    client: TestClient, session: Session
+) -> None:
+    post_user(client)
+
+    # A rollback only discards uncommitted work, so both rows must survive it.
+    session.rollback()
+
+    assert count(session, User) == 1
+    assert count(session, AuditEvent) == 1
+
+
+def test_create_user_audit_failure_persists_neither_user_nor_audit_event(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_add = AuditEventRepository.add
+
+    def add_then_fail(self: AuditEventRepository, event: AuditEvent) -> AuditEvent:
+        real_add(self, event)
+        raise RuntimeError("simulated audit failure")
+
+    monkeypatch.setattr(AuditEventRepository, "add", add_then_fail)
+
+    # TestClient re-raises unhandled server errors instead of returning a 500.
+    with pytest.raises(RuntimeError, match="simulated audit failure"):
+        post_user(client)
+
+    assert count(session, User) == 0
+    assert count(session, AuditEvent) == 0
+
+
+def test_create_user_duplicate_email_race_returns_409(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    post_user(client, email="ada@example.com")
+    # The pre-check misses the existing user, so the INSERT hits the constraint.
+    monkeypatch.setattr(UserRepository, "get_by_email", lambda self, email: None)
+
+    response = post_user(client, email="ada@example.com")
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "A user with email 'ada@example.com' already exists."
+    }
+    assert count(session, User) == 1
+    assert count(session, AuditEvent) == 1
+    # The failed transaction was rolled back, so the next request works.
+    assert client.get("/users").status_code == 200
+
+
+def test_create_user_failed_commit_is_not_reported_as_created(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Own client, so the server error becomes a 500 response instead of being
+    # re-raised: a 201 here would mean the commit ran after the response.
+    app = create_app()
+    app.dependency_overrides[get_session] = lambda: session
+
+    def fail_commit() -> None:
+        raise RuntimeError("simulated commit failure")
+
+    monkeypatch.setattr(session, "commit", fail_commit)
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = post_user(client)
+
+    assert response.status_code == 500
+    assert count(session, User) == 0
+    assert count(session, AuditEvent) == 0
 
 
 @pytest.mark.parametrize(

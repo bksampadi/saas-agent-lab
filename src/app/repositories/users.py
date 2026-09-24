@@ -1,11 +1,21 @@
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import User
 
 
+def is_duplicate_email(error: IntegrityError) -> bool:
+    """True only if ``error`` is the unique constraint on users.email.
+
+    SQLite reports the violated column, not the constraint name, so this
+    matches SQLite's exact message. Postgres will need its own check.
+    """
+    return str(error.orig) == "UNIQUE constraint failed: users.email"
+
+
 class UserRepository:
-    """Persistence for users. Never commits: the service owns the transaction."""
+    """Persistence for users. Never commits or rolls back."""
 
     def __init__(self, session: Session) -> None:
         self._session = session

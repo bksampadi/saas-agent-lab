@@ -1,4 +1,8 @@
-"""User use cases and transactional business rules."""
+"""User use cases and business rules.
+
+Services never commit or roll back: the caller owns the transaction, so
+several service calls can succeed or fail together.
+"""
 
 import re
 from typing import Any
@@ -8,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.models import AuditEvent, User, UserStatus
 from app.repositories.audit_events import AuditEventRepository
-from app.repositories.users import UserRepository
+from app.repositories.users import UserRepository, is_duplicate_email
 from app.services.errors import EmailAlreadyExists, InvalidInput, UserNotFound
 
 # Limits match the column sizes: users.email, users.name, audit_events.actor.
@@ -54,12 +58,11 @@ def _audit_snapshot(user: User) -> dict[str, Any]:
 
 class UserService:
     def __init__(self, session: Session) -> None:
-        self._session = session
         self._users = UserRepository(session)
         self._audit_events = AuditEventRepository(session)
 
     def create_user(self, *, email: str, name: str, actor: str) -> User:
-        """Create an active user and its audit event in one transaction."""
+        """Create an active user and its audit event in the caller's transaction."""
         email = _validated_email(email)
         name = _required_text(name, field="Name", max_length=NAME_MAX_LENGTH)
         actor = _required_text(actor, field="Actor", max_length=ACTOR_MAX_LENGTH)
@@ -71,29 +74,25 @@ class UserService:
             user = self._users.add(
                 User(email=email, name=name, status=UserStatus.ACTIVE)
             )
-            self._audit_events.add(
-                AuditEvent(
-                    actor=actor,
-                    action="user.create",
-                    entity_type="user",
-                    entity_id=user.id,
-                    before=None,
-                    after=_audit_snapshot(user),
-                )
-            )
-            self._session.commit()
         except IntegrityError as error:
-            self._session.rollback()
             # Another request may have created the same email between our check
-            # and our insert. Only report a duplicate if one now really exists;
-            # any other constraint failure is re-raised unchanged.
-            if self._users.get_by_email(email) is not None:
+            # and our insert. Only that constraint is reported as a duplicate;
+            # any other failure is re-raised unchanged. The session cannot be
+            # queried after a failed flush, so the error itself is inspected.
+            if is_duplicate_email(error):
                 raise EmailAlreadyExists(email) from error
             raise
-        except Exception:
-            self._session.rollback()
-            raise
 
+        self._audit_events.add(
+            AuditEvent(
+                actor=actor,
+                action="user.create",
+                entity_type="user",
+                entity_id=user.id,
+                before=None,
+                after=_audit_snapshot(user),
+            )
+        )
         return user
 
     def list_users(self) -> list[User]:

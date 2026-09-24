@@ -89,22 +89,63 @@ def test_create_user_writes_exactly_the_expected_audit_event(
     }
 
 
-# --- transactions -------------------------------------------------------------
+# --- transactions: the caller owns them ---------------------------------------
 
 
-def test_create_user_commits_user_and_audit_event(
+def forbid_ending_the_transaction(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def forbidden() -> None:
+        raise AssertionError("the service must not end the caller's transaction")
+
+    monkeypatch.setattr(session, "commit", forbidden)
+    monkeypatch.setattr(session, "rollback", forbidden)
+
+
+def test_create_user_neither_commits_nor_rolls_back(
+    service: UserService, session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    forbid_ending_the_transaction(session, monkeypatch)
+
+    service.create_user(email="ada@example.com", name="Ada", actor=ACTOR)
+    with pytest.raises(EmailAlreadyExists):
+        service.create_user(email="ADA@example.com", name="Ada", actor=ACTOR)
+
+    # The rejected duplicate did not undo the earlier, still uncommitted work.
+    assert session.in_transaction()
+    assert [user.email for user in all_users(session)] == ["ada@example.com"]
+
+
+def test_caller_rollback_discards_several_service_calls(
     service: UserService, session: Session
 ) -> None:
     service.create_user(email="ada@example.com", name="Ada", actor=ACTOR)
+    service.create_user(email="grace@example.com", name="Grace", actor=ACTOR)
 
-    # A rollback discards anything not yet committed.
     session.rollback()
 
-    assert [user.email for user in all_users(session)] == ["ada@example.com"]
-    assert len(all_audit_events(session)) == 1
+    assert all_users(session) == []
+    assert all_audit_events(session) == []
 
 
-def test_audit_failure_rolls_back_user_and_leaves_no_partial_audit_event(
+def test_caller_commit_persists_several_service_calls(
+    service: UserService, session: Session
+) -> None:
+    service.create_user(email="ada@example.com", name="Ada", actor=ACTOR)
+    service.create_user(email="grace@example.com", name="Grace", actor=ACTOR)
+    session.commit()
+
+    # A rollback only discards uncommitted work, so both survive it.
+    session.rollback()
+
+    assert [user.email for user in all_users(session)] == [
+        "ada@example.com",
+        "grace@example.com",
+    ]
+    assert len(all_audit_events(session)) == 2
+
+
+def test_audit_failure_leaves_neither_user_nor_audit_event_after_rollback(
     service: UserService, session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     real_add = AuditEventRepository.add
@@ -118,12 +159,14 @@ def test_audit_failure_rolls_back_user_and_leaves_no_partial_audit_event(
 
     monkeypatch.setattr(AuditEventRepository, "add", add_then_fail)
 
+    # session.begin() plays the caller: it rolls back when the block raises.
     with pytest.raises(RuntimeError, match="simulated audit failure"):
-        service.create_user(email="ada@example.com", name="Ada", actor=ACTOR)
+        with session.begin():
+            service.create_user(email="ada@example.com", name="Ada", actor=ACTOR)
 
     # Both rows existed inside the transaction...
     assert rows_before_failure == {"users": 1, "audit_events": 1}
-    # ...and the rollback removed both.
+    # ...and the caller's rollback removed both.
     assert all_users(session) == []
     assert all_audit_events(session) == []
 
@@ -146,32 +189,44 @@ def test_create_user_rejects_duplicate_normalized_email(
 def test_duplicate_email_race_is_reported_as_email_already_exists(
     service: UserService, session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    service.create_user(email="ada@example.com", name="Ada", actor=ACTOR)
+    with session.begin():
+        service.create_user(email="ada@example.com", name="Ada", actor=ACTOR)
 
     # Simulate a race: the pre-check misses the existing user (as if another
     # request committed it just after the check), so the INSERT hits the
-    # unique constraint. Later lookups see the real data again.
-    real_get_by_email = UserRepository.get_by_email
-    calls = 0
-
-    def miss_first_lookup(self: UserRepository, email: str) -> User | None:
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            return None
-        return real_get_by_email(self, email)
-
-    monkeypatch.setattr(UserRepository, "get_by_email", miss_first_lookup)
+    # real unique constraint.
+    monkeypatch.setattr(UserRepository, "get_by_email", lambda self, email: None)
 
     with pytest.raises(EmailAlreadyExists) as excinfo:
-        service.create_user(email="Ada@example.com", name="Ada Again", actor=ACTOR)
+        with session.begin():
+            service.create_user(email="Ada@example.com", name="Ada Again", actor=ACTOR)
 
     assert isinstance(excinfo.value.__cause__, IntegrityError)
     assert [user.name for user in all_users(session)] == ["Ada"]
     assert len(all_audit_events(session)) == 1
 
 
-def test_unrelated_integrity_error_is_not_reported_as_duplicate_email(
+def test_other_integrity_error_on_user_insert_is_not_a_duplicate_email(
+    service: UserService, session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_add = UserRepository.add
+
+    def add_without_name(self: UserRepository, user: User) -> User:
+        # Deliberately invalid: a real NOT NULL violation from SQLite.
+        user.name = None  # type: ignore[assignment]
+        return real_add(self, user)
+
+    monkeypatch.setattr(UserRepository, "add", add_without_name)
+
+    with pytest.raises(IntegrityError, match="NOT NULL constraint failed"):
+        with session.begin():
+            service.create_user(email="ada@example.com", name="Ada", actor=ACTOR)
+
+    assert all_users(session) == []
+    assert all_audit_events(session) == []
+
+
+def test_integrity_error_from_audit_insert_is_not_a_duplicate_email(
     service: UserService, session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def fail_with_integrity_error(
@@ -184,7 +239,8 @@ def test_unrelated_integrity_error_is_not_reported_as_duplicate_email(
     monkeypatch.setattr(AuditEventRepository, "add", fail_with_integrity_error)
 
     with pytest.raises(IntegrityError):
-        service.create_user(email="ada@example.com", name="Ada", actor=ACTOR)
+        with session.begin():
+            service.create_user(email="ada@example.com", name="Ada", actor=ACTOR)
 
     assert all_users(session) == []
     assert all_audit_events(session) == []

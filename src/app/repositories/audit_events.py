@@ -4,8 +4,8 @@ from app.models import AuditEvent
 
 
 class AuditEventRepository:
-    """Persistence for audit events. Never commits: the service commits each
-    event in the same transaction as the change it describes."""
+    """Persistence for audit events. Never commits or rolls back: each event
+    is written in the same transaction as the change it describes."""
 
     def __init__(self, session: Session) -> None:
         self._session = session
