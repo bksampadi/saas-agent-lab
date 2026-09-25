@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 
-from app.api import health, licences, users
+from app.api import assignments, health, licences, users
 from app.core.config import get_settings
 
 
@@ -9,6 +9,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(users.router)
     app.include_router(licences.router)
+    app.include_router(assignments.router)
     return app
 
 

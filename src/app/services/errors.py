@@ -31,3 +31,24 @@ class LicenceNotFound(DomainError):
     def __init__(self, licence_id: int) -> None:
         super().__init__(f"Licence {licence_id} not found.")
         self.licence_id = licence_id
+
+
+class UserInactive(DomainError):
+    def __init__(self, user_id: int) -> None:
+        super().__init__(f"User {user_id} is inactive.")
+        self.user_id = user_id
+
+
+class AssignmentAlreadyExists(DomainError):
+    def __init__(self, user_id: int, licence_id: int) -> None:
+        super().__init__(
+            f"User {user_id} already has an active assignment for licence {licence_id}."
+        )
+        self.user_id = user_id
+        self.licence_id = licence_id
+
+
+class NoSeatsAvailable(DomainError):
+    def __init__(self, licence_id: int) -> None:
+        super().__init__(f"Licence {licence_id} has no seats available.")
+        self.licence_id = licence_id
