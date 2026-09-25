@@ -17,6 +17,8 @@ from app.repositories.audit_events import AuditEventRepository
 from app.services.assignments import AssignmentService
 from app.services.errors import (
     AssignmentAlreadyExists,
+    AssignmentAlreadyRevoked,
+    AssignmentNotFound,
     InvalidInput,
     LicenceNotFound,
     NoSeatsAvailable,
@@ -487,3 +489,247 @@ def test_list_active_assignments_returns_empty_list(
     service: AssignmentService,
 ) -> None:
     assert service.list_active_assignments() == []
+
+
+# --- revocation ---------------------------------------------------------------
+
+
+def test_revoke_assignment_persists_utc_revoked_at_and_keeps_the_row(
+    service: AssignmentService, session: Session
+) -> None:
+    assignment = make_assignment(session, make_user(session), make_licence(session))
+    called_at = datetime.now(UTC)
+
+    returned = service.revoke_assignment(assignment_id=assignment.id, actor=ACTOR)
+    session.expire_all()  # force a reload from the database
+
+    stored = session.get(Assignment, assignment.id)
+    assert stored is not None
+    assert stored.revoked_at is not None
+    assert stored.revoked_at.tzinfo is UTC
+    assert called_at <= stored.revoked_at <= datetime.now(UTC)
+    assert returned.revoked_at == stored.revoked_at
+    assert len(all_assignments(session)) == 1
+
+
+def test_revoke_assignment_writes_exactly_the_expected_audit_event(
+    service: AssignmentService, session: Session
+) -> None:
+    user = make_user(session)
+    licence = make_licence(session)
+    assignment = make_assignment(session, user, licence)
+
+    service.revoke_assignment(assignment_id=assignment.id, actor=ACTOR)
+    session.expire_all()
+
+    stored = session.get(Assignment, assignment.id)
+    assert stored is not None and stored.revoked_at is not None
+    events = all_audit_events(session)
+    assert len(events) == 1
+    event_row = events[0]
+    assert event_row.actor == ACTOR
+    assert event_row.action == "assignment.revoke"
+    assert event_row.entity_type == "assignment"
+    assert event_row.entity_id == assignment.id
+    assert event_row.before == {
+        "user_id": user.id,
+        "licence_id": licence.id,
+        "revoked_at": None,
+    }
+    assert event_row.after == {
+        "user_id": user.id,
+        "licence_id": licence.id,
+        "revoked_at": stored.revoked_at.isoformat(),
+    }
+
+
+def test_revoke_audit_timestamp_is_the_persisted_revoke_timestamp(
+    service: AssignmentService, session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assignment = make_assignment(session, make_user(session), make_licence(session))
+    # A clock that moves on every read: if the audit event took its own
+    # reading instead of reusing the persisted value, the two would differ.
+    # (A real clock can return the same value twice and hide that bug.)
+    ticks = iter(
+        datetime(2026, 1, 1, 12, 0, second, tzinfo=UTC) for second in range(60)
+    )
+    monkeypatch.setattr("app.services.assignments.utcnow", lambda: next(ticks))
+
+    service.revoke_assignment(assignment_id=assignment.id, actor=ACTOR)
+    session.commit()
+    session.expire_all()  # both values come back from the database
+
+    stored = session.get(Assignment, assignment.id)
+    assert stored is not None
+    assert stored.revoked_at == datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    (event_row,) = all_audit_events(session)
+    assert event_row.after is not None
+    assert event_row.after["revoked_at"] == "2026-01-01T12:00:00+00:00"
+    assert datetime.fromisoformat(event_row.after["revoked_at"]) == stored.revoked_at
+
+
+def test_revoke_missing_assignment_raises_assignment_not_found(
+    service: AssignmentService, session: Session
+) -> None:
+    with pytest.raises(AssignmentNotFound):
+        service.revoke_assignment(assignment_id=999, actor=ACTOR)
+
+    assert all_audit_events(session) == []
+
+
+def test_revoke_already_revoked_assignment_is_rejected_without_audit_event(
+    service: AssignmentService, session: Session
+) -> None:
+    assignment = make_assignment(session, make_user(session), make_licence(session))
+    service.revoke_assignment(assignment_id=assignment.id, actor=ACTOR)
+    session.commit()
+    first_revoked_at = assignment.revoked_at
+
+    with pytest.raises(AssignmentAlreadyRevoked):
+        service.revoke_assignment(assignment_id=assignment.id, actor=ACTOR)
+    session.expire_all()
+
+    stored = session.get(Assignment, assignment.id)
+    assert stored is not None
+    assert stored.revoked_at == first_revoked_at  # not moved by the second call
+    assert [e.action for e in all_audit_events(session)] == ["assignment.revoke"]
+
+
+@pytest.mark.parametrize("actor", ["", "   ", "a" * 321])
+def test_revoke_assignment_rejects_invalid_actor(
+    service: AssignmentService, session: Session, actor: str
+) -> None:
+    assignment = make_assignment(session, make_user(session), make_licence(session))
+
+    with pytest.raises(InvalidInput):
+        service.revoke_assignment(assignment_id=assignment.id, actor=actor)
+    session.expire_all()
+
+    stored = session.get(Assignment, assignment.id)
+    assert stored is not None and stored.revoked_at is None
+    assert all_audit_events(session) == []
+
+
+# --- revocation: the caller owns the transaction ------------------------------
+
+
+def test_revoke_assignment_neither_commits_nor_rolls_back(
+    service: AssignmentService, session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assignment = make_assignment(session, make_user(session), make_licence(session))
+
+    def forbidden() -> None:
+        raise AssertionError("the service must not end the caller's transaction")
+
+    monkeypatch.setattr(session, "commit", forbidden)
+    monkeypatch.setattr(session, "rollback", forbidden)
+
+    service.revoke_assignment(assignment_id=assignment.id, actor=ACTOR)
+    with pytest.raises(AssignmentAlreadyRevoked):
+        service.revoke_assignment(assignment_id=assignment.id, actor=ACTOR)
+
+    # The rejected second revoke did not undo the first, still uncommitted one.
+    assert session.in_transaction()
+    assert len(all_audit_events(session)) == 1
+
+
+def test_caller_commit_persists_revocation_and_audit_event_together(
+    service: AssignmentService, session: Session
+) -> None:
+    assignment = make_assignment(session, make_user(session), make_licence(session))
+
+    with session.begin():
+        service.revoke_assignment(assignment_id=assignment.id, actor=ACTOR)
+
+    # A rollback only discards uncommitted work, so both changes must survive.
+    session.rollback()
+
+    stored = session.get(Assignment, assignment.id)
+    assert stored is not None and stored.revoked_at is not None
+    assert [e.action for e in all_audit_events(session)] == ["assignment.revoke"]
+
+
+def test_caller_rollback_discards_revocation_and_audit_event(
+    service: AssignmentService, session: Session
+) -> None:
+    assignment = make_assignment(session, make_user(session), make_licence(session))
+    service.revoke_assignment(assignment_id=assignment.id, actor=ACTOR)
+
+    session.rollback()
+
+    stored = session.get(Assignment, assignment.id)
+    assert stored is not None and stored.revoked_at is None
+    assert all_audit_events(session) == []
+
+
+def test_revoke_audit_failure_leaves_assignment_active_after_rollback(
+    service: AssignmentService, session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assignment = make_assignment(session, make_user(session), make_licence(session))
+    real_add = AuditEventRepository.add
+    revoked_in_db_before_failure: list[bool] = []
+
+    def add_then_fail(self: AuditEventRepository, event: AuditEvent) -> AuditEvent:
+        real_add(self, event)  # UPDATE and event are flushed, not committed
+        revoked_at = session.scalar(
+            select(Assignment.revoked_at).where(Assignment.id == assignment.id)
+        )
+        revoked_in_db_before_failure.append(revoked_at is not None)
+        raise RuntimeError("simulated audit failure")
+
+    monkeypatch.setattr(AuditEventRepository, "add", add_then_fail)
+
+    # session.begin() plays the caller: it rolls back when the block raises.
+    with pytest.raises(RuntimeError, match="simulated audit failure"):
+        with session.begin():
+            service.revoke_assignment(assignment_id=assignment.id, actor=ACTOR)
+
+    assert revoked_in_db_before_failure == [True]
+    stored = session.get(Assignment, assignment.id)
+    assert stored is not None and stored.revoked_at is None
+    assert all_audit_events(session) == []
+
+
+# --- revocation: effects on active assignments and capacity -------------------
+
+
+def test_revoked_assignment_is_not_listed_as_active(
+    service: AssignmentService, session: Session
+) -> None:
+    licence = make_licence(session)
+    kept = make_assignment(session, make_user(session, "a@example.com"), licence)
+    revoked = make_assignment(session, make_user(session, "b@example.com"), licence)
+
+    service.revoke_assignment(assignment_id=revoked.id, actor=ACTOR)
+
+    assert [a.id for a in service.list_active_assignments()] == [kept.id]
+
+
+def test_revocation_frees_a_seat(service: AssignmentService, session: Session) -> None:
+    licence = make_licence(session, seats=1)
+    holder = make_assignment(session, make_user(session, "a@example.com"), licence)
+    user = make_user(session, "b@example.com")
+    with pytest.raises(NoSeatsAvailable):
+        service.assign_licence(user_id=user.id, licence_id=licence.id, actor=ACTOR)
+
+    service.revoke_assignment(assignment_id=holder.id, actor=ACTOR)
+    service.assign_licence(user_id=user.id, licence_id=licence.id, actor=ACTOR)
+
+    assert [a.user_id for a in service.list_active_assignments()] == [user.id]
+
+
+def test_same_user_can_be_reassigned_after_revocation(
+    service: AssignmentService, session: Session
+) -> None:
+    user = make_user(session)
+    licence = make_licence(session)
+    first = service.assign_licence(user_id=user.id, licence_id=licence.id, actor=ACTOR)
+    service.revoke_assignment(assignment_id=first.id, actor=ACTOR)
+
+    # The INSERT must pass the real partial unique index.
+    second = service.assign_licence(user_id=user.id, licence_id=licence.id, actor=ACTOR)
+    session.commit()
+
+    assert second.id != first.id
+    assert [a.id for a in service.list_active_assignments()] == [second.id]
+    assert len(all_assignments(session)) == 2  # the revoked row is kept

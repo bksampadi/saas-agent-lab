@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -34,6 +36,15 @@ class AssignmentRepository:
         self._session.add(assignment)
         self._session.flush()  # sends the INSERT so assignment.id is assigned
         return assignment
+
+    def get(self, assignment_id: int) -> Assignment | None:
+        """Any assignment, active or revoked."""
+        return self._session.get(Assignment, assignment_id)
+
+    def mark_revoked(self, assignment: Assignment, *, revoked_at: datetime) -> None:
+        """Set ``revoked_at`` and send the UPDATE. The row is kept as history."""
+        assignment.revoked_at = revoked_at
+        self._session.flush()
 
     def get_active(self, user_id: int, licence_id: int) -> Assignment | None:
         statement = select(Assignment).where(

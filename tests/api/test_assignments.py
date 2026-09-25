@@ -408,3 +408,241 @@ def test_list_assignments_is_ordered_by_id(
     assert [a["id"] for a in response.json()] == sorted(
         [first["id"], second["id"], third["id"]]
     )
+
+
+# --- POST /assignments/{assignment_id}/revoke ---------------------------------
+
+
+def post_revoke(client: TestClient, assignment_id: int | str) -> httpx2.Response:
+    return client.post(f"/assignments/{assignment_id}/revoke", headers=ACTOR_HEADERS)
+
+
+def test_revoke_assignment_returns_200_with_revoked_assignment(
+    client: TestClient, session: Session
+) -> None:
+    user = make_user(session)
+    licence = make_licence(session)
+    created = post_assignment(client, user.id, licence.id).json()
+
+    response = post_revoke(client, created["id"])
+
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body) == {"id", "user_id", "licence_id", "assigned_at", "revoked_at"}
+    assert body["id"] == created["id"]
+    assert body["user_id"] == user.id
+    assert body["licence_id"] == licence.id
+    assert body["assigned_at"] == created["assigned_at"]
+    assert body["revoked_at"] is not None
+    assert datetime.fromisoformat(body["revoked_at"]).utcoffset() is not None
+
+
+def test_revoke_assignment_persists_revoked_at_and_audit_event(
+    client: TestClient, session: Session
+) -> None:
+    user = make_user(session)
+    licence = make_licence(session)
+    assignment = make_assignment(session, user, licence)
+
+    body = post_revoke(client, assignment.id).json()
+    session.expire_all()
+
+    stored = session.get(Assignment, assignment.id)
+    assert stored is not None and stored.revoked_at is not None
+    assert datetime.fromisoformat(body["revoked_at"]) == stored.revoked_at
+
+    events = session.scalars(select(AuditEvent)).all()
+    assert len(events) == 1
+    assert events[0].actor == "admin@example.com"
+    assert events[0].action == "assignment.revoke"
+    assert events[0].entity_type == "assignment"
+    assert events[0].entity_id == assignment.id
+    assert events[0].before == {
+        "user_id": user.id,
+        "licence_id": licence.id,
+        "revoked_at": None,
+    }
+    assert events[0].after == {
+        "user_id": user.id,
+        "licence_id": licence.id,
+        "revoked_at": stored.revoked_at.isoformat(),
+    }
+
+
+def test_revoke_assignment_is_committed_by_the_request_transaction(
+    client: TestClient, session: Session
+) -> None:
+    assignment = make_assignment(session, make_user(session), make_licence(session))
+    post_revoke(client, assignment.id)
+
+    # A rollback only discards uncommitted work, so both changes must survive.
+    session.rollback()
+
+    stored = session.get(Assignment, assignment.id)
+    assert stored is not None and stored.revoked_at is not None
+    assert count(session, AuditEvent) == 1
+
+
+def test_revoke_assignment_audit_failure_leaves_assignment_active(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assignment = make_assignment(session, make_user(session), make_licence(session))
+    real_add = AuditEventRepository.add
+
+    def add_then_fail(self: AuditEventRepository, event: AuditEvent) -> AuditEvent:
+        real_add(self, event)
+        raise RuntimeError("simulated audit failure")
+
+    monkeypatch.setattr(AuditEventRepository, "add", add_then_fail)
+
+    # TestClient re-raises unhandled server errors instead of returning a 500.
+    with pytest.raises(RuntimeError, match="simulated audit failure"):
+        post_revoke(client, assignment.id)
+
+    stored = session.get(Assignment, assignment.id)
+    assert stored is not None and stored.revoked_at is None
+    assert count(session, AuditEvent) == 0
+
+
+def test_revoke_assignment_failed_commit_is_not_reported_as_revoked(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assignment = make_assignment(session, make_user(session), make_licence(session))
+    # Own client, so the server error becomes a 500 response instead of being
+    # re-raised: a 200 here would mean the commit ran after the response.
+    app = create_app()
+    app.dependency_overrides[get_session] = lambda: session
+
+    def fail_commit() -> None:
+        raise RuntimeError("simulated commit failure")
+
+    monkeypatch.setattr(session, "commit", fail_commit)
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = post_revoke(client, assignment.id)
+
+    assert response.status_code == 500
+    stored = session.get(Assignment, assignment.id)
+    assert stored is not None and stored.revoked_at is None
+    assert count(session, AuditEvent) == 0
+
+
+def test_revoke_missing_assignment_returns_404(
+    client: TestClient, session: Session
+) -> None:
+    response = post_revoke(client, 999)
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Assignment 999 not found."}
+    assert count(session, AuditEvent) == 0
+
+
+def test_revoke_already_revoked_assignment_returns_409_without_audit_event(
+    client: TestClient, session: Session
+) -> None:
+    assignment = make_assignment(session, make_user(session), make_licence(session))
+    first = post_revoke(client, assignment.id).json()
+
+    response = post_revoke(client, assignment.id)
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": f"Assignment {assignment.id} is already revoked."
+    }
+    session.expire_all()
+    stored = session.get(Assignment, assignment.id)
+    assert stored is not None
+    assert stored.revoked_at == datetime.fromisoformat(first["revoked_at"])
+    assert count(session, AuditEvent) == 1
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [{}, {"X-Actor": ""}, {"X-Actor": "   "}, {"X-Actor": "a" * 321}],
+    ids=["missing", "empty", "whitespace", "too-long"],
+)
+def test_revoke_assignment_without_valid_actor_returns_422(
+    client: TestClient, session: Session, headers: dict[str, str]
+) -> None:
+    assignment = make_assignment(session, make_user(session), make_licence(session))
+
+    response = client.post(f"/assignments/{assignment.id}/revoke", headers=headers)
+
+    assert response.status_code == 422
+    session.expire_all()
+    stored = session.get(Assignment, assignment.id)
+    assert stored is not None and stored.revoked_at is None
+    assert count(session, AuditEvent) == 0
+
+
+@pytest.mark.parametrize("assignment_id", ["not-a-number", "1.5", 0, 2_147_483_648])
+def test_revoke_assignment_with_invalid_id_returns_422(
+    client: TestClient, session: Session, assignment_id: int | str
+) -> None:
+    response = post_revoke(client, assignment_id)
+
+    assert response.status_code == 422
+    assert count(session, AuditEvent) == 0
+
+
+def test_revoked_assignment_disappears_from_active_list(
+    client: TestClient, session: Session
+) -> None:
+    licence = make_licence(session)
+    kept = post_assignment(
+        client, make_user(session, "a@example.com").id, licence.id
+    ).json()
+    revoked = post_assignment(
+        client, make_user(session, "b@example.com").id, licence.id
+    ).json()
+
+    post_revoke(client, revoked["id"])
+
+    assert client.get("/assignments").json() == [kept]
+
+
+def test_revocation_frees_seat_for_another_user(
+    client: TestClient, session: Session
+) -> None:
+    licence = make_licence(session, seats=1)
+    user_a = make_user(session, "a@example.com")
+    user_b = make_user(session, "b@example.com")
+
+    assigned_a = post_assignment(client, user_a.id, licence.id)
+    assert assigned_a.status_code == 201
+
+    blocked_b = post_assignment(client, user_b.id, licence.id)
+    assert blocked_b.status_code == 409
+    assert blocked_b.json() == {
+        "detail": f"Licence {licence.id} has no seats available."
+    }
+
+    assert post_revoke(client, assigned_a.json()["id"]).status_code == 200
+
+    assigned_b = post_assignment(client, user_b.id, licence.id)
+    assert assigned_b.status_code == 201
+    assert client.get("/assignments").json() == [assigned_b.json()]
+    assert count(session, Assignment) == 2  # A's revoked row is kept
+
+
+def test_same_user_can_be_reassigned_after_revocation(
+    client: TestClient, session: Session
+) -> None:
+    user = make_user(session)
+    licence = make_licence(session)
+    first = post_assignment(client, user.id, licence.id).json()
+    post_revoke(client, first["id"])
+
+    response = post_assignment(client, user.id, licence.id)
+
+    assert response.status_code == 201
+    second = response.json()
+    assert second["id"] != first["id"]
+    assert client.get("/assignments").json() == [second]
+    assert count(session, Assignment) == 2
+    events = session.scalars(select(AuditEvent).order_by(AuditEvent.id))
+    assert [e.action for e in events] == [
+        "assignment.create",
+        "assignment.revoke",
+        "assignment.create",
+    ]

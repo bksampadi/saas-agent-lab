@@ -52,3 +52,15 @@ class NoSeatsAvailable(DomainError):
     def __init__(self, licence_id: int) -> None:
         super().__init__(f"Licence {licence_id} has no seats available.")
         self.licence_id = licence_id
+
+
+class AssignmentNotFound(DomainError):
+    def __init__(self, assignment_id: int) -> None:
+        super().__init__(f"Assignment {assignment_id} not found.")
+        self.assignment_id = assignment_id
+
+
+class AssignmentAlreadyRevoked(DomainError):
+    def __init__(self, assignment_id: int) -> None:
+        super().__init__(f"Assignment {assignment_id} is already revoked.")
+        self.assignment_id = assignment_id
