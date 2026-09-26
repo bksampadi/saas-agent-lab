@@ -37,7 +37,7 @@ Complete the core application, audit log, static UI and test suite before introd
 
 create user · create licence · deactivate user · assign licence · revoke licence
 
-Rules: deactivating a user revokes all their active assignments. A licence with no free seats cannot be assigned. Assigning an already-assigned licence to the same user is a no-op, not an error.
+Rules: deactivating a user revokes all their active assignments. A licence with no free seats cannot be assigned. Assigning a licence the user already actively holds is rejected with 409 Conflict (checked before seat capacity); once revoked, it can be assigned again.
 
 ## Stack
 
