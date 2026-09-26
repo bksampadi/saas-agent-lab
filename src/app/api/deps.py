@@ -3,14 +3,15 @@
 from collections.abc import Iterator
 from typing import Annotated
 
-from fastapi import Depends, Header
+from fastapi import Depends, Header, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_session
 from app.services.assignments import AssignmentService
+from app.services.errors import InvalidInput
 from app.services.licences import LicenceService
 from app.services.users import UserService
-from app.services.validation import ACTOR_MAX_LENGTH
+from app.services.validation import ACTOR_MAX_LENGTH, reject_reserved_actor
 
 
 def get_transaction(
@@ -50,5 +51,16 @@ def get_assignment_service(
 def get_actor(
     x_actor: Annotated[str, Header(min_length=1, max_length=ACTOR_MAX_LENGTH)],
 ) -> str:
-    """Trusted caller-supplied identity for the audit log, NOT authentication."""
+    """Trusted caller-supplied identity for the audit log, NOT authentication.
+
+    The "agent:" namespace is refused here, so an HTTP caller cannot write
+    audit events that look like an agent run's. The other actor rules stay
+    with the services.
+    """
+    try:
+        reject_reserved_actor(x_actor)
+    except InvalidInput as error:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
+        ) from error
     return x_actor
