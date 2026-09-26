@@ -80,3 +80,49 @@ def test_downgrade_base_removes_all_tables(empty_engine: Engine) -> None:
         command.downgrade(config, "base")
 
     assert inspect(empty_engine).get_table_names() == ["alembic_version"]
+
+
+def check_constraint_sql(engine: Engine) -> dict[str, dict[str | None, str]]:
+    inspector = inspect(engine)
+    return {
+        table: {c["name"]: c["sqltext"] for c in inspector.get_check_constraints(table)}
+        for table in inspector.get_table_names()
+        if table != "alembic_version"
+    }
+
+
+def test_upgrade_head_matches_model_check_constraint_sql(empty_engine: Engine) -> None:
+    # Names alone would not catch a migration whose CHECK text drifted from
+    # the model's.
+    with empty_engine.begin() as connection:
+        command.upgrade(alembic_config(connection), "head")
+
+    reference = create_db_engine("sqlite://", poolclass=StaticPool)
+    try:
+        Base.metadata.create_all(reference)
+        assert check_constraint_sql(empty_engine) == check_constraint_sql(reference)
+    finally:
+        reference.dispose()
+
+
+def test_downgrade_0002_leaves_the_initial_schema_and_upgrades_again(
+    empty_engine: Engine,
+) -> None:
+    with empty_engine.begin() as connection:
+        config = alembic_config(connection)
+        command.upgrade(config, "head")
+        command.downgrade(config, "0001")
+
+    assert sorted(inspect(empty_engine).get_table_names()) == [
+        "alembic_version",
+        "assignments",
+        "audit_events",
+        "licences",
+        "users",
+    ]
+
+    with empty_engine.begin() as connection:
+        command.upgrade(alembic_config(connection), "head")
+        diff = compare_metadata(MigrationContext.configure(connection), Base.metadata)
+
+    assert diff == []

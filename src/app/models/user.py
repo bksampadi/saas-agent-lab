@@ -4,17 +4,12 @@ from enum import StrEnum
 from sqlalchemy import Enum, String
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.models.base import Base, UTCDateTime, utcnow
+from app.models.base import Base, UTCDateTime, enum_values, utcnow
 
 
 class UserStatus(StrEnum):
     ACTIVE = "active"
     INACTIVE = "inactive"
-
-
-def _enum_values(enum_cls: type[StrEnum]) -> list[str]:
-    # Store "active", not the member name "ACTIVE".
-    return [member.value for member in enum_cls]
 
 
 class User(Base):
@@ -32,7 +27,7 @@ class User(Base):
             name="user_status",
             native_enum=False,
             create_constraint=True,
-            values_callable=_enum_values,
+            values_callable=enum_values,
             length=16,
         ),
         default=UserStatus.ACTIVE,

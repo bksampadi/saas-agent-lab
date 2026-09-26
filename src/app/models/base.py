@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any
 
 from sqlalchemy import DateTime, Dialect, MetaData
@@ -22,6 +23,12 @@ class Base(DeclarativeBase):
 
 def utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def enum_values(enum_cls: type[StrEnum]) -> list[str]:
+    """For ``Enum(values_callable=...)``: store "active", not the member name
+    "ACTIVE"."""
+    return [member.value for member in enum_cls]
 
 
 class UTCDateTime(TypeDecorator[datetime]):
