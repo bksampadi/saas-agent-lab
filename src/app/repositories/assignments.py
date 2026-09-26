@@ -61,6 +61,15 @@ class AssignmentRepository:
         )
         return self._session.scalar(statement) or 0
 
+    def list_for_user(self, user_id: int) -> list[Assignment]:
+        """Active and revoked assignments, ordered by id."""
+        statement = (
+            select(Assignment)
+            .where(Assignment.user_id == user_id)
+            .order_by(Assignment.id)
+        )
+        return list(self._session.scalars(statement))
+
     def list_active(self) -> list[Assignment]:
         statement = (
             select(Assignment)

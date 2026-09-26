@@ -317,3 +317,41 @@ def test_list_users_returns_users_ordered_by_id(service: UserService) -> None:
 def test_get_user_raises_user_not_found(service: UserService) -> None:
     with pytest.raises(UserNotFound):
         service.get_user(999)
+
+
+# --- lookup by email ----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "lookup", ["ada@example.com", "ADA@Example.COM", "  ada@example.com\t"]
+)
+def test_find_user_by_email_matches_the_normalized_email(
+    service: UserService, lookup: str
+) -> None:
+    user = service.create_user(email="ada@example.com", name="Ada", actor=ACTOR)
+
+    found = service.find_user_by_email(lookup)
+
+    assert found is not None
+    assert found.id == user.id
+
+
+@pytest.mark.parametrize(
+    "lookup", ["bob@example.com", "ada@example.co", "da@example.com"]
+)
+def test_find_user_by_email_never_matches_a_different_email(
+    service: UserService, lookup: str
+) -> None:
+    service.create_user(email="ada@example.com", name="Ada", actor=ACTOR)
+
+    assert service.find_user_by_email(lookup) is None
+
+
+@pytest.mark.parametrize(
+    "email", ["", "   ", "not-an-email", "a b@example.com", "x" * 321 + "@e.com"]
+)
+def test_find_user_by_email_rejects_invalid_email(
+    service: UserService, email: str
+) -> None:
+    with pytest.raises(InvalidInput):
+        service.find_user_by_email(email)

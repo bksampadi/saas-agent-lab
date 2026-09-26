@@ -272,3 +272,61 @@ def test_get_licence_returns_licence(service: LicenceService) -> None:
 def test_get_licence_raises_licence_not_found(service: LicenceService) -> None:
     with pytest.raises(LicenceNotFound):
         service.get_licence(999)
+
+
+# --- lookup by product --------------------------------------------------------
+
+
+@pytest.mark.parametrize("lookup", ["Figma", "figma", "FIGMA", "  fIgMa\t"])
+def test_find_licences_by_product_ignores_case_and_surrounding_whitespace(
+    service: LicenceService, lookup: str
+) -> None:
+    licence = service.create_licence(product="Figma", seats_total=5, actor=ACTOR)
+    service.create_licence(product="Slack", seats_total=5, actor=ACTOR)
+
+    assert [found.id for found in service.find_licences_by_product(lookup)] == [
+        licence.id
+    ]
+
+
+def test_find_licences_by_product_returns_every_match_ordered_by_id(
+    service: LicenceService,
+) -> None:
+    # The unique constraint is case-sensitive, so both rows can exist.
+    first = service.create_licence(product="Figma", seats_total=5, actor=ACTOR)
+    second = service.create_licence(product="FIGMA", seats_total=5, actor=ACTOR)
+
+    matches = service.find_licences_by_product("Figma")
+
+    assert [found.id for found in matches] == [first.id, second.id]
+
+
+@pytest.mark.parametrize("lookup", ["Fig", "Figma Pro", "Fig ma", "Figmа"])
+def test_find_licences_by_product_never_matches_partially_or_approximately(
+    service: LicenceService, lookup: str
+) -> None:
+    # The last lookup ends in a Cyrillic "а", which only looks like "a".
+    service.create_licence(product="Figma", seats_total=5, actor=ACTOR)
+
+    assert service.find_licences_by_product(lookup) == []
+
+
+def test_find_licences_by_product_folds_non_ascii_case(
+    service: LicenceService,
+) -> None:
+    # SQLite's lower() would miss this; casefold() does not.
+    licence = service.create_licence(
+        product="Ångström Suite", seats_total=5, actor=ACTOR
+    )
+
+    assert [
+        found.id for found in service.find_licences_by_product("ÅNGSTRÖM SUITE")
+    ] == [licence.id]
+
+
+@pytest.mark.parametrize("product", ["", "   ", "x" * 201])
+def test_find_licences_by_product_rejects_invalid_product(
+    service: LicenceService, product: str
+) -> None:
+    with pytest.raises(InvalidInput):
+        service.find_licences_by_product(product)

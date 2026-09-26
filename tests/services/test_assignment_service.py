@@ -733,3 +733,87 @@ def test_same_user_can_be_reassigned_after_revocation(
     assert second.id != first.id
     assert [a.id for a in service.list_active_assignments()] == [second.id]
     assert len(all_assignments(session)) == 2  # the revoked row is kept
+
+
+# --- reads used by the agent layer --------------------------------------------
+
+
+def test_list_assignments_for_user_includes_revoked_and_excludes_other_users(
+    service: AssignmentService, session: Session
+) -> None:
+    figma = make_licence(session, "Figma")
+    slack = make_licence(session, "Slack")
+    ada = make_user(session, "ada@example.com")
+    bob = make_user(session, "bob@example.com")
+    revoked = make_assignment(session, ada, figma, revoked=True)
+    make_assignment(session, bob, figma)
+    active = make_assignment(session, ada, slack)
+
+    listed = service.list_assignments_for_user(ada.id)
+
+    assert [(a.id, a.revoked_at is None) for a in listed] == [
+        (revoked.id, False),
+        (active.id, True),
+    ]
+
+
+def test_list_assignments_for_missing_user_raises_user_not_found(
+    service: AssignmentService,
+) -> None:
+    with pytest.raises(UserNotFound):
+        service.list_assignments_for_user(999)
+
+
+def test_get_active_assignment_ignores_revoked_rows_and_other_pairs(
+    service: AssignmentService, session: Session
+) -> None:
+    figma = make_licence(session, "Figma")
+    slack = make_licence(session, "Slack")
+    ada = make_user(session, "ada@example.com")
+    bob = make_user(session, "bob@example.com")
+    make_assignment(session, ada, figma, revoked=True)
+    make_assignment(session, bob, figma)
+    make_assignment(session, ada, slack)
+
+    assert service.get_active_assignment(user_id=ada.id, licence_id=figma.id) is None
+
+    current = make_assignment(session, ada, figma)
+    found = service.get_active_assignment(user_id=ada.id, licence_id=figma.id)
+    assert found is not None and found.id == current.id
+
+
+def test_get_seat_usage_counts_active_assignments_of_that_licence_only(
+    service: AssignmentService, session: Session
+) -> None:
+    figma = make_licence(session, "Figma", seats=3)
+    slack = make_licence(session, "Slack", seats=3)
+    make_assignment(session, make_user(session, "a@example.com"), figma)
+    make_assignment(session, make_user(session, "b@example.com"), figma, revoked=True)
+    make_assignment(session, make_user(session, "c@example.com"), slack)
+
+    usage = service.get_seat_usage(figma.id)
+
+    assert usage.licence.id == figma.id
+    assert (usage.licence.seats_total, usage.seats_active) == (3, 1)
+    assert usage.seats_available == 2
+
+
+def test_get_seat_usage_never_reports_negative_availability(
+    service: AssignmentService, session: Session
+) -> None:
+    # Seeded past capacity directly; the service itself would refuse.
+    licence = make_licence(session, seats=1)
+    make_assignment(session, make_user(session, "a@example.com"), licence)
+    make_assignment(session, make_user(session, "b@example.com"), licence)
+
+    usage = service.get_seat_usage(licence.id)
+
+    assert usage.seats_active == 2
+    assert usage.seats_available == 0
+
+
+def test_get_seat_usage_for_missing_licence_raises_licence_not_found(
+    service: AssignmentService,
+) -> None:
+    with pytest.raises(LicenceNotFound):
+        service.get_seat_usage(999)

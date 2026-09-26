@@ -82,3 +82,24 @@ class LicenceService:
         if licence is None:
             raise LicenceNotFound(licence_id)
         return licence
+
+    def find_licences_by_product(self, product: str) -> list[Licence]:
+        """Every licence whose product name equals ``product`` ignoring case
+        and surrounding whitespace, ordered by id. Never a partial match.
+
+        Product names are unique only case-sensitively, so this can return
+        more than one licence; choosing between them is the caller's problem.
+        Raises InvalidInput for an empty or over-long ``product``.
+
+        Compared in Python with casefold() rather than SQL lower(), which
+        SQLite applies to ASCII letters only. This loads every licence, which
+        is fine at this application's scale.
+        """
+        wanted = required_text(
+            product, field="Product", max_length=PRODUCT_MAX_LENGTH
+        ).casefold()
+        return [
+            licence
+            for licence in self._licences.list_all()
+            if licence.product.casefold() == wanted
+        ]

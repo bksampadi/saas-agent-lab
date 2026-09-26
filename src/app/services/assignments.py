@@ -3,12 +3,13 @@
 Services never commit or roll back: the caller owns the transaction.
 """
 
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models import Assignment, AuditEvent, UserStatus
+from app.models import Assignment, AuditEvent, Licence, UserStatus
 from app.models.base import utcnow
 from app.repositories.assignments import (
     AssignmentRepository,
@@ -43,6 +44,20 @@ def _revocation_snapshot(assignment: Assignment) -> dict[str, Any]:
         **_audit_snapshot(assignment),
         "revoked_at": None if revoked_at is None else revoked_at.isoformat(),
     }
+
+
+@dataclass(frozen=True)
+class SeatUsage:
+    """A licence's seats at the moment of reading: an observation, not a
+    reservation. assign_licence re-checks capacity when it inserts."""
+
+    licence: Licence
+    seats_active: int
+
+    @property
+    def seats_available(self) -> int:
+        # Never negative, even if seats_total is below the active count.
+        return max(self.licence.seats_total - self.seats_active, 0)
 
 
 class AssignmentService:
@@ -148,3 +163,26 @@ class AssignmentService:
 
     def list_active_assignments(self) -> list[Assignment]:
         return self._assignments.list_active()
+
+    def list_assignments_for_user(self, user_id: int) -> list[Assignment]:
+        """The user's active and revoked assignments, ordered by id."""
+        if self._users.get(user_id) is None:
+            raise UserNotFound(user_id)
+        return self._assignments.list_for_user(user_id)
+
+    def get_active_assignment(
+        self, *, user_id: int, licence_id: int
+    ) -> Assignment | None:
+        """The one active (not revoked) assignment of this licence to this
+        user, if there is one."""
+        return self._assignments.get_active(user_id, licence_id)
+
+    def get_seat_usage(self, licence_id: int) -> SeatUsage:
+        """Counted the same way assign_licence counts: active assignments only."""
+        licence = self._licences.get(licence_id)
+        if licence is None:
+            raise LicenceNotFound(licence_id)
+        return SeatUsage(
+            licence=licence,
+            seats_active=self._assignments.count_active_for_licence(licence_id),
+        )

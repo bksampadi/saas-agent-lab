@@ -94,3 +94,11 @@ class UserService:
         if user is None:
             raise UserNotFound(user_id)
         return user
+
+    def find_user_by_email(self, email: str) -> User | None:
+        """Exact match on the normalized email, the same form it is stored in.
+
+        Raises InvalidInput if ``email`` is not a valid email, so a lookup can
+        never succeed for input that could not have been stored.
+        """
+        return self._users.get_by_email(_validated_email(email))
