@@ -9,9 +9,10 @@ Build the application layer first: explicit boundaries, persistent state, migrat
 - v0.1 SaaS application: complete.
 - Day 1, deterministic agent execution foundation: complete. Persisted `AgentRun` and `ToolCall`, deterministic resolver, persisted resolved goal, goal-scoped executor with separate log and business transactions, audit actor `agent:run-<id>`, state-based verifier.
 - Day 2A, natural-language intent extraction: complete. PydanticAI turns an instruction into a closed `ExtractedIntent` union (`EnsureAssignmentIntent | NeedsClarification | Unsupported`). Every model request is persisted as a `ModelCall`; model calls and tool calls share one ordered trace per run.
-- Next, Day 2B: a bounded decision loop. After resolution, a model chooses among argument-free tools bound to the run's resolved goal, executed through the Day 1 executor.
+- Day 2B, bounded model-directed execution: complete. `AgentExecutor.decide` lets a model choose among four argument-free tools bound to the run's persisted goal (`agent/decision_tools.py`), executed through the Day 1 executor. The model concludes with a closed proposal (`GoalReached | NoActionNeeded | CannotProceed`). Id-free observations are persisted on each `ToolCall`, and the initial context on the run. Limits are enforced by application code (`step_limit`). The run's outcome comes from `decision.decision_outcome`, never from the proposal.
+- Next, Day 2C: not started. The live-provider test belongs there.
 
-LLM and model integration is permitted, within the authority boundary below. Natural-language instructions are extracted but do not yet drive model-directed execution; `harness.run_instruction` runs the deterministic Day 1 steps after extraction.
+LLM and model integration is permitted, within the authority boundary below. `harness.run_instruction` still runs the deterministic Day 1 steps after extraction; `harness.run_directed_instruction` hands the resolved run to a decision planner.
 
 ## Authority boundary
 
@@ -30,7 +31,7 @@ A model's output is never evidence that something happened. Only the verifier, r
 
 - v0.1 SaaS application: CRUD, audit log, constraints, request transactions, tests, type checking
 - v0.2 agent execution foundation: persisted runs and tool calls, deterministic resolution, goal-scoped typed tools, traces, postcondition verification
-- v0.3 autonomous planning and human control: natural-language requests (Day 2A done), bounded model decisions (Day 2B next), planner-visible observations, policy checks, approval checkpoints, cancellation
+- v0.3 autonomous planning and human control: natural-language requests (Day 2A done), bounded model decisions and planner-visible observations (Day 2B done), policy checks, approval checkpoints, cancellation
 - v0.4 browser execution and operator UI: Playwright, agent runs and approvals in a web interface
 - v0.5 agent evaluation: frozen scenarios, state-based success, counter-evidence and observation coverage, model comparison, latency, tokens, cost
 - v0.6 production hardening: PostgreSQL, authentication/authorization, durable execution, idempotency, concurrency, retries, observability
@@ -47,23 +48,26 @@ A model's output is never evidence that something happened. Only the verifier, r
 
 ## Agent rules
 
-- `agent/` holds the executor, resolver, verifier, tools, harness and planners. The executor opens its own short sessions: log transactions (runs, tool calls, model calls) and business transactions are never open at the same time, and no session is open while a model runs.
+- `agent/` holds the executor, resolver, verifier, tools, observations, the decision contract (limits, context, outcome table), harness and planners. The executor opens its own short sessions: log transactions (runs, tool calls, model calls) and business transactions are never open at the same time, and no session is open while a model runs.
 - A model reaches the application only through a planner interface (`agent/planner.py`) with a fake-able implementation. Model output is a closed Pydantic union with `extra="forbid"`: no id fields, no free-form fields.
 - Every model request, accepted, rejected or failed, is persisted as a `ModelCall` as soon as it has an outcome. Retries are bounded by explicit constants.
 - `AgentRun.last_sequence_no` orders the trace and nothing else. It is not a limit.
 - Tests never send a real model request: `tests/conftest.py` sets `pydantic_ai.models.ALLOW_MODEL_REQUESTS = False`. Use `FunctionModel`, `TestModel` or a fake planner. No test needs an API key.
 - Default model: `SAL_PLANNER_MODEL`, `anthropic:claude-sonnet-5`. Model comparison belongs to evaluation, not to defaults.
 
-## Day 2B design constraints
+## Decision-stage rules
 
-Decided; not built yet.
-
+- Model-facing tools take no arguments. The model chooses the capability; `GoalBoundTools` builds the call from the run's persisted goal and sends it through `AgentExecutor.call_decision_tool`. Never add an entity argument to a model-facing tool.
 - Keep three representations of a tool call's result distinct:
   1. the internal executor result: may contain entity and database ids; used only by deterministic application code;
-  2. the model-visible observation: a separate DTO with no entity or database ids, only what is intentionally shown to the model;
-  3. the persisted model-visible observation: an exact, deterministic serialization of (2), recording exactly what crossed the model boundary (needed for counter-evidence and observation-coverage evaluation).
-  Never use the internal result itself as the model observation.
-- Execution limits are separate, explicit counters: model requests, read tool calls and mutating tool calls. Never derive a limit from `last_sequence_no`.
+  2. the model-visible observation (`agent/observations.py`): a separate closed DTO with no entity or database ids, only what is intentionally shown to the model;
+  3. the persisted model-visible observation (`ToolCall.observation`): the exact, deterministic serialization of (2), written with the call's outcome and returned to the model as that same text.
+  Never use the internal result itself as the model observation, and never build model-visible text from `str(exception)`: rejections are closed reason codes.
+- The initial model context (instructions and prompt) contains no ids and is persisted verbatim on the run (`decision_context`) before the first request.
+- Execution limits are separate, explicit counters: `MAX_DECISION_MODEL_REQUESTS`, `MAX_DECISION_READ_CALLS` and `MAX_DECISION_MUTATION_CALLS` (`agent/decision.py`), counted from persisted rows. A mutation attempt counts even if rejected. Reaching a limit is an exception that stops the loop and ends the run FAILED (`step_limit`), never an observation. Never derive a limit from `last_sequence_no`.
+- A domain rejection of an allowed call is an observation: the model may react to it.
+- The model's proposal is recorded on the run and never sets its status. A `CannotProceed` reason blocks a run only when the application confirms it against current state (`verifier.check_block`).
+- No forced precondition sweep: nothing is read on the model's behalf.
 
 ## Entities
 
