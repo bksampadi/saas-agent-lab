@@ -4,13 +4,13 @@ A B2B SaaS administration system for exploring safe, verifiable autonomous-agent
 
 The application provides users, licences, assignments, revocation and audit logging behind explicit service and persistence boundaries. On top of that, the agent execution layer now provides persisted runs and tool calls, deterministic entity resolution, goal-scoped typed actions, independent execution logging, and state-based postcondition verification.
 
-The agent foundation is deliberately model-independent: application state remains authoritative for identity, business rules, transaction success and goal satisfaction.
+A language model (via PydanticAI) now has one job: extracting what a natural-language instruction asks for into a closed, id-free intent, which then goes to the deterministic resolver. Every model request is persisted in the run's trace. Application state remains authoritative for identity, business rules, transaction success and goal satisfaction.
 
-**Status:** Agent execution foundation implemented. Natural-language planning and model integration are next.
+**Status:** Agent execution foundation and natural-language intent extraction implemented. Natural-language instructions do not yet drive model-directed execution; a bounded model decision loop is next.
 
 ## Stack
 
-Python 3.12 · FastAPI · SQLAlchemy 2 · Alembic · Pydantic v2 · SQLite · pytest · Ruff · Pyright · uv
+Python 3.12 · FastAPI · SQLAlchemy 2 · Alembic · Pydantic v2 · PydanticAI · SQLite · pytest · Ruff · Pyright · uv
 
 
 ## Run locally
@@ -59,7 +59,7 @@ uv run ruff format --check .
 uv run pyright
 ```
 
-Tests use isolated SQLite databases and do not access production infrastructure or the network.
+Tests use isolated SQLite databases and do not access production infrastructure or the network. Real model requests are blocked in tests, which use scripted models and need no API key.
 
 ## Architecture
 
@@ -73,10 +73,14 @@ flowchart LR
     Service --> Audit[Audit log]
     Audit --> DB
 
-    AgentRun[Agent execution] --> Resolver[Deterministic resolver]
+    Instruction --> Planner[Intent extraction: PydanticAI]
+    Planner --> ModelTrace[Model-call trace]
+    Planner --> AgentRun[Agent execution]
+    AgentRun --> Resolver[Deterministic resolver]
     Resolver --> Tools[Goal-scoped typed tools]
     Tools --> Service
     Tools --> Trace[Tool-call trace]
+    ModelTrace --> DB
     Trace --> DB
 
     Service --> Verifier[Postcondition verifier]
@@ -86,11 +90,11 @@ flowchart LR
 ```text
 src/app/
   api/           # HTTP routes and request transaction boundary
-  agent/         # resolver, verifier, typed tools, executor and harness
+  agent/         # planners, resolver, verifier, typed tools, executor and harness
   schemas/       # Pydantic request/response and agent contracts
   services/      # business rules; never commit or roll back
   repositories/  # database queries; add and flush, never commit
-  models/        # SQLAlchemy models including AgentRun and ToolCall
+  models/        # SQLAlchemy models including AgentRun, ToolCall and ModelCall
   core/          # settings and database setup
 
 alembic/         # database migrations
@@ -100,6 +104,8 @@ tests/           # API, service, model, agent and migration tests
 Ordinary application requests flow `api → services → repositories → database`.
 
 Agent execution uses short, separate transaction boundaries so execution history survives failed business mutations. Agent-initiated mutations reuse the same application services and keep the business change and its audit event atomic.
+
+Model calls and tool calls share one per-run sequence, so a run's trace has a single order that never depends on timestamps.
 
 Final success is determined by querying application state against the persisted resolved goal, not by trusting a tool result or model-generated claim.
 
