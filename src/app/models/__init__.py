@@ -15,6 +15,7 @@ from app.models.assignment import Assignment
 from app.models.audit_event import AuditEvent
 from app.models.base import Base
 from app.models.licence import Licence
+from app.models.model_call import ModelCall, ModelCallStage, ModelCallStatus
 from app.models.tool_call import ToolCall, ToolCallStatus
 from app.models.user import User, UserStatus
 
@@ -27,6 +28,9 @@ __all__ = [
     "DesiredState",
     "GoalType",
     "Licence",
+    "ModelCall",
+    "ModelCallStage",
+    "ModelCallStatus",
     "OutcomeReason",
     "ToolCall",
     "ToolCallStatus",

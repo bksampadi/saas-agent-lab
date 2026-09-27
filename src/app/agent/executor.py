@@ -16,6 +16,9 @@ So a rolled-back change leaves the run's history intact, and on SQLite no
 log write holds a lock while a business write waits for it. No ORM object
 crosses from one session to the next; only ids and plain values do.
 
+Model calls and tool calls take their sequence_no from one per-run counter,
+so a run's trace has a single order that never depends on timestamps.
+
 Known crash windows (no recovery yet): a crash after the business commit
 but before the ToolCall's outcome is written leaves the call STARTED; the
 change is still traceable to the run through its audit actor
@@ -198,7 +201,14 @@ def _unexpected_detail(stage: str, error: Exception) -> dict[str, Any]:
 
 
 def _persisted_goal(run: AgentRun) -> ResolvedAssignmentGoal:
-    if run.resolved_user_id is None or run.resolved_licence_id is None:
+    if (
+        run.resolved_user_id is None
+        or run.resolved_licence_id is None
+        or run.goal_type is None
+        or run.desired_state is None
+        or run.extracted_user_email is None
+        or run.extracted_product is None
+    ):
         raise RunNotExecutable(run.id, run.status)
     return ResolvedAssignmentGoal(
         goal_type=run.goal_type,
@@ -219,11 +229,43 @@ def _tool_context(session: Session, actor: str) -> tools.ToolContext:
     )
 
 
+def _validated_request(instruction: str, requesting_actor: str) -> str:
+    """The normalized requesting actor, or raise InvalidInput."""
+    requesting_actor = validated_external_actor(requesting_actor)
+    if not instruction.strip():
+        raise InvalidInput("Instruction must not be empty.")
+    if len(instruction) > INSTRUCTION_MAX_LENGTH:
+        raise InvalidInput(
+            f"Instruction must be at most {INSTRUCTION_MAX_LENGTH} characters."
+        )
+    return requesting_actor
+
+
 class AgentExecutor:
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         self._sessions = session_factory
 
     # --- run lifecycle ----------------------------------------------------------
+
+    def receive_run(self, *, instruction: str, requesting_actor: str) -> int:
+        """Persist a RECEIVED run for a natural-language instruction and return
+        its id, before any model is called.
+
+        Nothing is extracted yet: the goal columns stay NULL until the
+        instruction's intent is extracted. Raises InvalidInput, and records
+        nothing, exactly as create_run does. The instruction is stored
+        exactly as given.
+        """
+        requesting_actor = _validated_request(instruction, requesting_actor)
+        with self._sessions.begin() as log:
+            run = AgentRunRepository(log).add(
+                AgentRun(
+                    instruction=instruction,
+                    requesting_actor=requesting_actor,
+                    status=AgentRunStatus.RECEIVED,
+                )
+            )
+            return run.id
 
     def create_run(
         self,
@@ -238,13 +280,7 @@ class AgentExecutor:
         instruction or an invalid requesting actor ("agent:" is reserved).
         The instruction and extracted text are stored exactly as given.
         """
-        requesting_actor = validated_external_actor(requesting_actor)
-        if not instruction.strip():
-            raise InvalidInput("Instruction must not be empty.")
-        if len(instruction) > INSTRUCTION_MAX_LENGTH:
-            raise InvalidInput(
-                f"Instruction must be at most {INSTRUCTION_MAX_LENGTH} characters."
-            )
+        requesting_actor = _validated_request(instruction, requesting_actor)
 
         with self._sessions.begin() as log:
             run = AgentRunRepository(log).add(
@@ -268,7 +304,12 @@ class AgentExecutor:
         """
         with self._sessions() as log:
             run = self._get_run(log, run_id)
-            if run.status is not AgentRunStatus.RECEIVED:
+            if (
+                run.status is not AgentRunStatus.RECEIVED
+                or run.extracted_user_email is None
+                or run.extracted_product is None
+            ):
+                # Not RECEIVED, or not extracted yet: there is nothing to resolve.
                 raise RunNotExecutable(run_id, run.status)
             intent = ExtractedAssignmentIntent(
                 user_email=run.extracted_user_email, product=run.extracted_product

@@ -3,6 +3,10 @@
 Every status change goes through ``transition``. Terminal statuses are final.
 COMPLETED is reachable only from VERIFYING; the executor enters it only when
 the verifier reports the goal satisfied.
+
+Extraction happens within RECEIVED and adds no status: it either fills in
+the run's goal columns, leaving it RECEIVED and ready for resolution, or
+ends the run (NEEDS_CLARIFICATION or FAILED, with an extraction reason).
 """
 
 from typing import Any
@@ -33,6 +37,8 @@ REASONS_BY_STATUS: dict[AgentRunStatus, frozenset[OutcomeReason]] = {
     Status.COMPLETED: frozenset({Reason.GOAL_SATISFIED, Reason.ALREADY_SATISFIED}),
     Status.NEEDS_CLARIFICATION: frozenset(
         {
+            Reason.UNSUPPORTED_REQUEST,
+            Reason.INSTRUCTION_UNCLEAR,
             Reason.INVALID_INPUT,
             Reason.USER_NOT_FOUND,
             Reason.LICENCE_NOT_FOUND,
@@ -42,6 +48,7 @@ REASONS_BY_STATUS: dict[AgentRunStatus, frozenset[OutcomeReason]] = {
     Status.BLOCKED: frozenset({Reason.NO_SEATS_AVAILABLE, Reason.USER_INACTIVE}),
     Status.FAILED: frozenset(
         {
+            Reason.PLANNER_ERROR,
             Reason.GOAL_SCOPE_VIOLATION,
             Reason.TOOL_FAILED,
             Reason.VERIFICATION_FAILED,
