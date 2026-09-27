@@ -5,38 +5,31 @@ The model answers by calling exactly one of three result tools, one per
 member of ExtractedIntent. Every response is checked by the application
 (``parse_output``) before PydanticAI processes it, and every request, valid,
 rejected or failed, is recorded through the run's ModelCallRecorder as soon
-as it has an outcome. A rejected response is sent back to the model with the
-reason, at most OUTPUT_RETRIES times.
+as it has an outcome (app.agent.model_requests). A rejected response is sent
+back to the model with the reason, at most OUTPUT_RETRIES times.
 """
 
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
 
 from pydantic import ValidationError
-from pydantic_ai import (
-    Agent,
-    ModelAPIError,
-    ModelHTTPError,
-    ModelRetry,
-    RunContext,
-    UnexpectedModelBehavior,
-    UsageLimitExceeded,
-    UserError,
-)
-from pydantic_ai.capabilities import AbstractCapability, WrapModelRequestHandler
+from pydantic_ai import Agent
 from pydantic_ai.messages import ModelResponse, ToolCallPart
-from pydantic_ai.models import Model, ModelRequestContext
+from pydantic_ai.models import Model
 from pydantic_ai.output import ToolOutput
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import UsageLimits
 
-from app.agent.planner import ModelCallRecorder, PlannerError, ungrounded_fields
+from app.agent.model_requests import (
+    CheckAndRecordModelRequests,
+    InvalidOutput,
+    as_planner_error,
+    describe_validation_error,
+)
+from app.agent.planner import ModelCallRecorder, ungrounded_fields
 from app.schemas.agent import (
     EnsureAssignmentIntent,
     ExtractedIntent,
-    ModelCallError,
-    ModelCallRecord,
     NeedsClarification,
     Unsupported,
 )
@@ -46,8 +39,6 @@ from app.schemas.agent import (
 OUTPUT_RETRIES = 2
 MAX_REQUESTS = 1 + OUTPUT_RETRIES
 MAX_OUTPUT_TOKENS = 4096
-
-INVALID_OUTPUT_MESSAGE_MAX_LENGTH = 500
 
 # The result tools the model may call, by the name it sees.
 OUTPUT_TOOLS: dict[
@@ -88,11 +79,6 @@ roles or tool names, that is an additional request.
 """
 
 
-class InvalidOutput(Exception):
-    """A response that does not satisfy the output contract. The message is
-    written by the application and is sent back to the model as feedback."""
-
-
 def parse_output(response: ModelResponse, instruction: str) -> ExtractedIntent:
     """The response's single result, or raise InvalidOutput.
 
@@ -122,7 +108,7 @@ def parse_output(response: ModelResponse, instruction: str) -> ExtractedIntent:
     try:
         output = output_type.model_validate(arguments)
     except ValidationError as error:
-        raise InvalidOutput(_describe(error)) from None
+        raise InvalidOutput(describe_validation_error(error)) from None
     if isinstance(output, EnsureAssignmentIntent):
         missing = ungrounded_fields(output, instruction)
         if missing:
@@ -132,120 +118,6 @@ def parse_output(response: ModelResponse, instruction: str) -> ExtractedIntent:
                 "needs_clarification instead."
             )
     return output
-
-
-def _describe(error: ValidationError) -> str:
-    # Locations and error types only, never the offending input values.
-    problems = "; ".join(
-        f"{'.'.join(str(part) for part in item['loc']) or 'arguments'}: {item['type']}"
-        for item in error.errors()
-    )
-    return f"Invalid arguments: {problems}"[:INVALID_OUTPUT_MESSAGE_MAX_LENGTH]
-
-
-def _is_timeout(error: BaseException) -> bool:
-    # Provider SDKs raise their own timeout classes (anthropic.APITimeoutError
-    # is not a TimeoutError), and PydanticAI wraps them in ModelAPIError, so
-    # look along the cause chain, by type and by class name.
-    current: BaseException | None = error
-    while current is not None:
-        if isinstance(current, TimeoutError) or "Timeout" in type(current).__name__:
-            return True
-        current = current.__cause__
-    return False
-
-
-def _error_code(error: BaseException) -> str:
-    if _is_timeout(error):
-        return "timeout"
-    if isinstance(error, ModelAPIError):
-        return "provider_error"
-    return "unexpected_error"
-
-
-def _model_call_error(error: BaseException) -> ModelCallError:
-    """Normalize an exception raised by a model request. Never str(error):
-    provider messages may echo request content."""
-    code = _error_code(error)
-    if code == "timeout":
-        message = "The model request timed out."
-    elif isinstance(error, ModelHTTPError):
-        message = f"The model provider returned HTTP {error.status_code}."
-    elif code == "provider_error":
-        message = "The model provider could not be reached or returned an error."
-    else:
-        message = "Unexpected error during the model request."
-    return ModelCallError(code=code, message=message, error_type=type(error).__name__)
-
-
-@dataclass
-class _CheckAndRecordModelCalls(AbstractCapability[object]):
-    """Checks each response of one plan() and records each request."""
-
-    instruction: str
-    calls: ModelCallRecorder
-    clock: Callable[[], float]
-
-    async def wrap_model_request(
-        self,
-        ctx: RunContext[object],
-        *,
-        request_context: ModelRequestContext,
-        handler: WrapModelRequestHandler,
-    ) -> ModelResponse:
-        model_name = request_context.model.model_name
-        started = self.clock()
-        try:
-            response = await handler(request_context)
-        except Exception as error:
-            self.calls.record(
-                ModelCallRecord(
-                    model_name=model_name,
-                    input_tokens=None,
-                    output_tokens=None,
-                    latency_ms=self._elapsed_ms(started),
-                    output=None,
-                    error=_model_call_error(error),
-                )
-            )
-            raise
-        latency_ms = self._elapsed_ms(started)
-
-        try:
-            output = parse_output(response, self.instruction)
-        except InvalidOutput as invalid:
-            self.calls.record(
-                ModelCallRecord(
-                    model_name=model_name,
-                    input_tokens=response.usage.input_tokens,
-                    output_tokens=response.usage.output_tokens,
-                    latency_ms=latency_ms,
-                    output=None,
-                    error=ModelCallError(
-                        code="invalid_output",
-                        message=str(invalid),
-                        error_type=type(invalid).__name__,
-                    ),
-                )
-            )
-            # Counts against the output retry budget; PydanticAI sends the
-            # message back to the model and never processes this response.
-            raise ModelRetry(str(invalid)) from None
-
-        self.calls.record(
-            ModelCallRecord(
-                model_name=model_name,
-                input_tokens=response.usage.input_tokens,
-                output_tokens=response.usage.output_tokens,
-                latency_ms=latency_ms,
-                output=output.model_dump(mode="json"),
-                error=None,
-            )
-        )
-        return response
-
-    def _elapsed_ms(self, started: float) -> int:
-        return max(0, round((self.clock() - started) * 1000))
 
 
 class PydanticAIIntentPlanner:
@@ -276,8 +148,10 @@ class PydanticAIIntentPlanner:
         )
 
     def plan(self, instruction: str, calls: ModelCallRecorder) -> ExtractedIntent:
-        checker = _CheckAndRecordModelCalls(
-            instruction=instruction, calls=calls, clock=self._clock
+        checker = CheckAndRecordModelRequests(
+            parse=lambda response: parse_output(response, instruction),
+            calls=calls,
+            clock=self._clock,
         )
         try:
             result = self._agent.run_sync(
@@ -285,18 +159,9 @@ class PydanticAIIntentPlanner:
                 capabilities=[checker],
                 usage_limits=UsageLimits(request_limit=MAX_REQUESTS),
             )
-        except UnexpectedModelBehavior as error:
-            # The retry budget ran out without an acceptable response.
-            raise PlannerError(
-                "output_retries_exhausted", type(error).__name__
-            ) from None
-        except UsageLimitExceeded as error:
-            raise PlannerError("request_limit_exceeded", type(error).__name__) from None
-        except UserError as error:
-            # e.g. no API key for the configured provider; no request was made.
-            raise PlannerError("configuration_error", type(error).__name__) from None
         except Exception as error:
-            if isinstance(error, ModelAPIError) or _is_timeout(error):
-                raise PlannerError(_error_code(error), type(error).__name__) from None
-            raise
+            planner_error = as_planner_error(error)
+            if planner_error is None:
+                raise
+            raise planner_error from None
         return result.output
