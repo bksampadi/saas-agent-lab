@@ -60,7 +60,24 @@ class OutcomeReason(StrEnum):
     GOAL_SCOPE_VIOLATION = "goal_scope_violation"
     TOOL_FAILED = "tool_failed"
     VERIFICATION_FAILED = "verification_failed"
+    STEP_LIMIT = "step_limit"  # a decision-stage limit was reached
     UNEXPECTED_ERROR = "unexpected_error"
+
+
+class DecisionProposalKind(StrEnum):
+    """What a decision model concluded. Its opinion, never the run's outcome."""
+
+    GOAL_REACHED = "goal_reached"
+    NO_ACTION_NEEDED = "no_action_needed"
+    CANNOT_PROCEED = "cannot_proceed"
+
+
+class CannotProceedReason(StrEnum):
+    """The blocking conditions a decision model may claim. Each one is checked
+    against current application state before it can block a run."""
+
+    NO_SEATS_AVAILABLE = "no_seats_available"
+    USER_INACTIVE = "user_inactive"
 
 
 class AgentRun(Base):
@@ -134,8 +151,27 @@ class AgentRun(Base):
             "AND outcome_reason IN ('no_seats_available', 'user_inactive')) "
             "OR (status = 'failed' AND outcome_reason IN ('planner_error', "
             "'goal_scope_violation', 'tool_failed', 'verification_failed', "
-            "'unexpected_error'))))",
+            "'step_limit', 'unexpected_error'))))",
             name="outcome_matches_status",
+        ),
+        # The decision stage starts only on a resolved goal, and a proposal
+        # is recorded only after its context is.
+        CheckConstraint(
+            "decision_context IS NULL OR resolved_user_id IS NOT NULL",
+            name="decision_context_needs_resolution",
+        ),
+        CheckConstraint(
+            "decision_proposal IS NULL OR decision_context IS NOT NULL",
+            name="decision_proposal_needs_context",
+        ),
+        # A reason exactly when the proposal is cannot_proceed. A CASE,
+        # because a comparison with NULL is NULL and NULL passes a CHECK; a
+        # NULL proposal takes the ELSE branch.
+        CheckConstraint(
+            "CASE WHEN decision_proposal = 'cannot_proceed' "
+            "THEN decision_reason_code IS NOT NULL "
+            "ELSE decision_reason_code IS NULL END",
+            name="decision_reason_matches_proposal",
         ),
     )
 
@@ -198,6 +234,32 @@ class AgentRun(Base):
     # AgentRunRepository.next_sequence_no. It orders the trace and nothing
     # else: it is not a budget or limit on model requests or tool calls.
     last_sequence_no: Mapped[int] = mapped_column(default=0, server_default="0")
+    # {"instructions": ..., "prompt": ...}: exactly what the decision model is
+    # sent before its first request, so what it was told is known later
+    # without re-rendering anything. Never contains a row id.
+    decision_context: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON(none_as_null=True)
+    )
+    decision_proposal: Mapped[DecisionProposalKind | None] = mapped_column(
+        Enum(
+            DecisionProposalKind,
+            name="agent_decision_proposal",
+            native_enum=False,
+            create_constraint=True,
+            values_callable=enum_values,
+            length=32,
+        )
+    )
+    decision_reason_code: Mapped[CannotProceedReason | None] = mapped_column(
+        Enum(
+            CannotProceedReason,
+            name="agent_cannot_proceed_reason",
+            native_enum=False,
+            create_constraint=True,
+            values_callable=enum_values,
+            length=32,
+        )
+    )
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         UTCDateTime(), default=utcnow, onupdate=utcnow

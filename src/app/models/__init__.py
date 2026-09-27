@@ -7,6 +7,8 @@ tables on ``Base.metadata`` (Alembic and the test fixtures rely on this).
 from app.models.agent_run import (
     AgentRun,
     AgentRunStatus,
+    CannotProceedReason,
+    DecisionProposalKind,
     DesiredState,
     GoalType,
     OutcomeReason,
@@ -25,6 +27,8 @@ __all__ = [
     "Assignment",
     "AuditEvent",
     "Base",
+    "CannotProceedReason",
+    "DecisionProposalKind",
     "DesiredState",
     "GoalType",
     "Licence",

@@ -104,11 +104,14 @@ class CheckAndRecordModelRequests(AbstractCapability[Any]):
     """Checks each response of one planner call and records each request.
 
     ``parse`` returns a response's accepted output, or raises InvalidOutput.
+    ``before_request``, if set, runs before every request and may refuse it
+    by raising; the refused request is not made and not recorded.
     """
 
     parse: Callable[[ModelResponse], BaseModel]
     calls: ModelCallRecorder
     clock: Callable[[], float]
+    before_request: Callable[[], None] | None = None
 
     async def wrap_model_request(
         self,
@@ -117,6 +120,8 @@ class CheckAndRecordModelRequests(AbstractCapability[Any]):
         request_context: ModelRequestContext,
         handler: WrapModelRequestHandler,
     ) -> ModelResponse:
+        if self.before_request is not None:
+            self.before_request()
         model_name = request_context.model.model_name
         started = self.clock()
         try:

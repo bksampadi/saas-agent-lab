@@ -2,18 +2,26 @@
 
 Takes the persisted goal and reads current application state. It never sees
 tool results or planner output, so neither can make a run succeed.
+
+check_block does the same for a blocking condition a decision model claims:
+it reads current state, never what the model saw earlier, so a claim can
+block a run only when the application finds the condition itself.
 """
 
 from typing import assert_never
 
-from app.models import DesiredState
+from app.models import CannotProceedReason, DesiredState, UserStatus
 from app.schemas.agent import (
     AssignmentSnapshot,
+    BlockCheck,
+    LicenceSnapshot,
     ResolvedAssignmentGoal,
+    UserSnapshot,
     VerificationEvidence,
     VerificationResult,
 )
 from app.services.assignments import AssignmentService
+from app.services.users import UserService
 
 
 def verify(
@@ -38,3 +46,32 @@ def verify(
             ),
         )
     assert_never(goal.desired_state)
+
+
+def check_block(
+    users: UserService,
+    assignments: AssignmentService,
+    goal: ResolvedAssignmentGoal,
+    reason: CannotProceedReason,
+) -> BlockCheck:
+    """Whether ``reason`` holds for the goal's user and licence now, by the
+    same rules assign_licence applies."""
+    match reason:
+        case CannotProceedReason.NO_SEATS_AVAILABLE:
+            usage = assignments.get_seat_usage(goal.licence_id)
+            return BlockCheck(
+                reason=reason,
+                confirmed=usage.seats_available == 0,
+                user=None,
+                licence=LicenceSnapshot.of(usage),
+            )
+        case CannotProceedReason.USER_INACTIVE:
+            user = users.get_user(goal.user_id)
+            return BlockCheck(
+                reason=reason,
+                confirmed=user.status is not UserStatus.ACTIVE,
+                user=UserSnapshot.of(user),
+                licence=None,
+            )
+        case _:
+            assert_never(reason)

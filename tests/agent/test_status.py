@@ -32,7 +32,9 @@ def test_transition_table_is_exactly_the_approved_one() -> None:
         S.RECEIVED: {S.RESOLVED, S.NEEDS_CLARIFICATION, S.FAILED},
         S.RESOLVED: {S.EXECUTING, S.FAILED},
         S.EXECUTING: {S.VERIFYING, S.BLOCKED, S.FAILED},
-        S.VERIFYING: {S.COMPLETED, S.FAILED},
+        # BLOCKED from VERIFYING: a model-directed run's block is established
+        # by the application only after verification finds the goal unmet.
+        S.VERIFYING: {S.COMPLETED, S.BLOCKED, S.FAILED},
         S.COMPLETED: set(),
         S.NEEDS_CLARIFICATION: set(),
         S.BLOCKED: set(),

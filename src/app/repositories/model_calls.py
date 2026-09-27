@@ -1,7 +1,7 @@
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.models import ModelCall
+from app.models import ModelCall, ModelCallStage
 from app.repositories.agent_runs import AgentRunRepository
 
 
@@ -27,3 +27,10 @@ class ModelCallRepository:
             .order_by(ModelCall.sequence_no)
         )
         return list(self._session.scalars(statement))
+
+    def count_for_stage(self, agent_run_id: int, stage: ModelCallStage) -> int:
+        """How many requests the run's ``stage`` has made, failed ones included."""
+        statement = select(func.count(ModelCall.id)).where(
+            ModelCall.agent_run_id == agent_run_id, ModelCall.stage == stage
+        )
+        return self._session.execute(statement).scalar_one()

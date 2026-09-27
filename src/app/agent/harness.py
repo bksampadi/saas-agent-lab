@@ -1,16 +1,19 @@
-"""A deterministic run of one ensure-assignment goal.
+"""Runs of one ensure-assignment goal, from start to a terminal status.
 
-Test scaffolding and the reference path a decision planner will follow; not
-a planner. Every step goes through the executor, so the same checks apply as
-will apply to a model: the goal is resolved and persisted first, tool calls
-are scoped to it, and only the verifier can complete the run.
+``run_ensure_assignment`` and ``run_instruction`` are deterministic: test
+scaffolding and the reference path, not a planner. Every step goes through
+the executor, so the same checks apply as apply to a model: the goal is
+resolved and persisted first, tool calls are scoped to it, and only the
+verifier can complete the run. ``run_instruction`` starts from natural
+language: a planner extracts the intent, and nothing after that step
+involves a model.
 
-``run_instruction`` starts from natural language: a planner extracts the
-intent, and nothing after that step involves a model.
+``run_directed_instruction`` also starts from natural language, and after
+resolution a decision planner chooses the tool calls (AgentExecutor.decide).
 """
 
 from app.agent.executor import AgentExecutor
-from app.agent.planner import IntentPlanner
+from app.agent.planner import DecisionPlanner, IntentPlanner
 from app.models import AgentRunStatus
 from app.schemas.agent import (
     AssignLicenceInput,
@@ -53,6 +56,30 @@ def run_instruction(
     )
     if executor.extract_intent(run_id, planner) is AgentRunStatus.RECEIVED:
         _resolve_and_execute(executor, run_id)
+    return run_id
+
+
+def run_directed_instruction(
+    executor: AgentExecutor,
+    intent_planner: IntentPlanner,
+    decision_planner: DecisionPlanner,
+    *,
+    instruction: str,
+    requesting_actor: str,
+) -> int:
+    """Drive one natural-language run to a terminal status, letting
+    ``decision_planner`` choose its tool calls, and return its id.
+
+    Extraction and resolution are exactly as in run_instruction; only a
+    RESOLVED run reaches the decision stage.
+    """
+    run_id = executor.receive_run(
+        instruction=instruction, requesting_actor=requesting_actor
+    )
+    if executor.extract_intent(run_id, intent_planner) is not AgentRunStatus.RECEIVED:
+        return run_id
+    if executor.resolve_run(run_id) is AgentRunStatus.RESOLVED:
+        executor.decide(run_id, decision_planner)
     return run_id
 
 

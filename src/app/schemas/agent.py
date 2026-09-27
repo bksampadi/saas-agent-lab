@@ -1,6 +1,7 @@
 """Contracts of the agent layer: what a planner may extract from an
 instruction, the goal the resolver produces, tool arguments and results,
-model-call records, and the verifier's result.
+model-call records, the verifier's result, and what crosses the model
+boundary in the decision stage.
 
 Tool results are structured facts read from the application at one moment
 (snapshots), never prose summaries. A later read may disagree with them.
@@ -16,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_vali
 
 from app.models import (
     Assignment,
+    CannotProceedReason,
     DesiredState,
     GoalType,
     OutcomeReason,
@@ -315,6 +317,18 @@ class VerificationResult(BaseModel):
     evidence: VerificationEvidence
 
 
+class BlockCheck(BaseModel):
+    """A blocking condition a decision model claimed, checked by the
+    application against current state. Internal: may carry row ids."""
+
+    model_config = ConfigDict(frozen=True)
+
+    reason: CannotProceedReason
+    confirmed: bool
+    user: UserSnapshot | None  # the state read, for user_inactive
+    licence: LicenceSnapshot | None  # the state read, for no_seats_available
+
+
 # --- model-visible observations -----------------------------------------------
 #
 # A tool call's outcome as a model sees it: a separate, closed DTO built from
@@ -376,3 +390,86 @@ ModelObservation = (
     | TargetAssignmentsObservation
     | AssignmentAttemptObservation
 )
+
+
+# --- decision stage -----------------------------------------------------------
+#
+# After resolution, a model may choose among four tools bound to the run's
+# goal and then conclude. Everything below crosses the model boundary, in
+# one direction or the other, so none of it has an id field, a free-form
+# field or a dictionary, and extra="forbid" rejects anything not declared.
+
+
+# The model-facing tools, by the name the model sees. None takes arguments:
+# the application binds each one to the run's resolved goal.
+TargetToolName = Literal[
+    "get_target_user",
+    "get_target_licence_capacity",
+    "list_target_user_assignments",
+    "assign_target_licence",
+]
+
+
+class DecisionTask(BaseModel):
+    """The goal as the decision model is told it: the semantic values
+    persisted on the run when its intent was extracted, never resolved ids."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    goal_type: GoalType
+    user_email: str
+    product: str
+
+
+class DecisionContext(BaseModel):
+    """Exactly what the decision model is sent before its first request.
+    Persisted verbatim on the run before that request is made."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    instructions: str
+    prompt: str
+
+
+# Proposals: how the model concludes. Each is its opinion; the verifier and
+# the application's own checks decide the run's outcome.
+
+
+class GoalReached(BaseModel):
+    """The model believes the user now holds a seat because of its action."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal["goal_reached"] = "goal_reached"
+
+
+class NoActionNeeded(BaseModel):
+    """The model believes the user already held a seat."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal["no_action_needed"] = "no_action_needed"
+
+
+class CannotProceed(BaseModel):
+    """The model believes a blocking condition stops the goal."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal["cannot_proceed"] = "cannot_proceed"
+    reason_code: CannotProceedReason
+
+
+DecisionProposal = Annotated[
+    GoalReached | NoActionNeeded | CannotProceed, Field(discriminator="kind")
+]
+
+
+class DecisionToolRequest(BaseModel):
+    """A decision response that asks for tool calls, as its ModelCall records
+    it: which tools, in the order requested."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal["tool_calls"] = "tool_calls"
+    tool_names: list[TargetToolName]

@@ -1,6 +1,6 @@
 from collections.abc import Collection
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models import ToolCall, ToolCallStatus
@@ -53,3 +53,25 @@ class ToolCallRepository:
             ToolCall.status == ToolCallStatus.SUCCEEDED,
         )
         return self._session.scalars(statement).first() is not None
+
+    def count_for_tools(self, agent_run_id: int, tool_names: Collection[str]) -> int:
+        """How many calls of these tools the run has recorded, whatever their
+        outcome: each one was an attempt."""
+        statement = select(func.count(ToolCall.id)).where(
+            ToolCall.agent_run_id == agent_run_id, ToolCall.tool_name.in_(tool_names)
+        )
+        return self._session.execute(statement).scalar_one()
+
+    def latest_for_tools(
+        self, agent_run_id: int, tool_names: Collection[str]
+    ) -> ToolCall | None:
+        """The run's most recent call of any of these tools, in trace order."""
+        statement = (
+            select(ToolCall)
+            .where(
+                ToolCall.agent_run_id == agent_run_id,
+                ToolCall.tool_name.in_(tool_names),
+            )
+            .order_by(ToolCall.sequence_no.desc())
+        )
+        return self._session.scalars(statement).first()

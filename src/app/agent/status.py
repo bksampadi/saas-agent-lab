@@ -7,6 +7,12 @@ the verifier reports the goal satisfied.
 Extraction happens within RECEIVED and adds no status: it either fills in
 the run's goal columns, leaving it RECEIVED and ready for resolution, or
 ends the run (NEEDS_CLARIFICATION or FAILED, with an extraction reason).
+
+BLOCKED is reached from EXECUTING when a deterministic tool call is
+rejected by a blocking domain rule, and from VERIFYING when a model-directed
+run's goal is unsatisfied and a blocking condition is established by the
+application (a rejected assignment, or a claimed condition confirmed
+against current state). The model's proposal alone never reaches it.
 """
 
 from typing import Any
@@ -24,7 +30,7 @@ ALLOWED_TRANSITIONS: dict[AgentRunStatus, frozenset[AgentRunStatus]] = {
     ),
     Status.RESOLVED: frozenset({Status.EXECUTING, Status.FAILED}),
     Status.EXECUTING: frozenset({Status.VERIFYING, Status.BLOCKED, Status.FAILED}),
-    Status.VERIFYING: frozenset({Status.COMPLETED, Status.FAILED}),
+    Status.VERIFYING: frozenset({Status.COMPLETED, Status.BLOCKED, Status.FAILED}),
     Status.COMPLETED: frozenset(),
     Status.NEEDS_CLARIFICATION: frozenset(),
     Status.BLOCKED: frozenset(),
@@ -52,6 +58,7 @@ REASONS_BY_STATUS: dict[AgentRunStatus, frozenset[OutcomeReason]] = {
             Reason.GOAL_SCOPE_VIOLATION,
             Reason.TOOL_FAILED,
             Reason.VERIFICATION_FAILED,
+            Reason.STEP_LIMIT,
             Reason.UNEXPECTED_ERROR,
         }
     ),

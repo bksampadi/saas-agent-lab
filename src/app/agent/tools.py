@@ -34,6 +34,9 @@ TOOL_INPUTS = (
 MUTATING_TOOL_NAMES = frozenset(
     tool_input.tool_name for tool_input in TOOL_INPUTS if tool_input.mutating
 )
+READ_TOOL_NAMES = frozenset(
+    tool_input.tool_name for tool_input in TOOL_INPUTS if not tool_input.mutating
+)
 
 
 @dataclass(frozen=True)

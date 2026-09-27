@@ -1,9 +1,14 @@
-"""The planner boundary: an instruction in, an unresolved intent out.
+"""The planner boundary: where a model reaches the application.
 
-A planner interprets text. It is never authoritative for which rows exist
-or are meant (the resolver decides), whether a change is allowed (the
-services decide), whether it happened (the business transaction decides)
-or whether the goal holds (the verifier decides).
+An intent planner turns an instruction into an unresolved intent. A
+decision planner, after resolution, chooses which goal-bound tools to call
+and concludes with a proposal.
+
+A planner interprets and chooses. It is never authoritative for which rows
+exist or are meant (the resolver decides), what a tool acts on (the run's
+persisted goal decides), whether a change is allowed (the services decide),
+whether it happened (the business transaction decides) or whether the goal
+holds (the verifier decides).
 
 The executor hands a planner a ModelCallRecorder bound to the run and
 stage. The planner reports every model request through it as soon as the
@@ -13,7 +18,13 @@ planning then fails.
 
 from typing import Protocol
 
-from app.schemas.agent import EnsureAssignmentIntent, ExtractedIntent, ModelCallRecord
+from app.schemas.agent import (
+    DecisionContext,
+    DecisionProposal,
+    EnsureAssignmentIntent,
+    ExtractedIntent,
+    ModelCallRecord,
+)
 
 
 class ModelCallRecorder(Protocol):
@@ -28,6 +39,50 @@ class IntentPlanner(Protocol):
 
         Raises PlannerError when no acceptable answer was obtained within the
         planner's bounds.
+        """
+        ...
+
+
+class DecisionModelCallRecorder(ModelCallRecorder, Protocol):
+    def before_request(self) -> None:
+        """Call before every model request. Raises DecisionLimitExceeded,
+        and the request must not be made, if it would exceed the stage's
+        request limit."""
+        ...
+
+
+class TargetTools(Protocol):
+    """The decision model's tools, bound by the application to the run's
+    resolved goal. None takes an argument, so nothing a model says can name
+    a user, licence or assignment.
+
+    Each returns the call's observation: the exact text persisted with the
+    call. Each may raise DecisionStopped (a limit, or a failure that ended
+    the run), which must end the planner's loop at once.
+    """
+
+    def get_target_user(self) -> str: ...
+
+    def get_target_licence_capacity(self) -> str: ...
+
+    def list_target_user_assignments(self) -> str: ...
+
+    def assign_target_licence(self) -> str: ...
+
+
+class DecisionPlanner(Protocol):
+    def decide(
+        self,
+        context: DecisionContext,
+        tools: TargetTools,
+        calls: DecisionModelCallRecorder,
+    ) -> DecisionProposal:
+        """Call ``tools`` as the model chooses, then return its proposal.
+
+        ``context`` is exactly what the model is to be sent first; it is
+        already persisted. Raises PlannerError when no acceptable answer was
+        obtained within the planner's bounds, and lets DecisionStopped
+        through unchanged.
         """
         ...
 

@@ -10,7 +10,7 @@ from app.models.base import Base, UTCDateTime, enum_values, utcnow
 
 class ModelCallStage(StrEnum):
     EXTRACTION = "extraction"  # instruction -> intent
-    DECISION = "decision"  # reserved for choosing tool calls after resolution
+    DECISION = "decision"  # choosing tool calls after resolution
 
 
 class ModelCallStatus(StrEnum):
