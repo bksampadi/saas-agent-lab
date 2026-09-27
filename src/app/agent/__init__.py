@@ -1,6 +1,7 @@
-"""Deterministic agent execution on top of the application's services.
+"""Agent execution on top of the application's services.
 
-No model lives here. The application decides identity (resolver), what may be
-touched (goal scope), whether a change happened (business transaction) and
-whether the goal holds (verifier).
+A model has one job here so far: turning an instruction into an unresolved
+intent (``planner``). The application decides everything else: identity
+(resolver), what may be touched (goal scope), whether a change happened
+(business transaction) and whether the goal holds (verifier).
 """

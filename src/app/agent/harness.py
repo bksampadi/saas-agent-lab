@@ -1,12 +1,16 @@
-"""A deterministic, model-free run of one ensure-assignment goal.
+"""A deterministic run of one ensure-assignment goal.
 
-Test scaffolding and the reference path a planner will follow; not a planner.
-Every step goes through the executor, so the same checks apply as will apply
-to a model: the goal is resolved and persisted first, tool calls are scoped
-to it, and only the verifier can complete the run.
+Test scaffolding and the reference path a decision planner will follow; not
+a planner. Every step goes through the executor, so the same checks apply as
+will apply to a model: the goal is resolved and persisted first, tool calls
+are scoped to it, and only the verifier can complete the run.
+
+``run_instruction`` starts from natural language: a planner extracts the
+intent, and nothing after that step involves a model.
 """
 
 from app.agent.executor import AgentExecutor
+from app.agent.planner import IntentPlanner
 from app.models import AgentRunStatus
 from app.schemas.agent import (
     AssignLicenceInput,
@@ -28,13 +32,38 @@ def run_ensure_assignment(
     run_id = executor.create_run(
         instruction=instruction, requesting_actor=requesting_actor, intent=intent
     )
+    _resolve_and_execute(executor, run_id)
+    return run_id
+
+
+def run_instruction(
+    executor: AgentExecutor,
+    planner: IntentPlanner,
+    *,
+    instruction: str,
+    requesting_actor: str,
+) -> int:
+    """Drive one natural-language run to a terminal status and return its id.
+
+    Only an extracted assignment intent goes on to resolution; any other
+    extraction outcome has already ended the run, with nothing attempted.
+    """
+    run_id = executor.receive_run(
+        instruction=instruction, requesting_actor=requesting_actor
+    )
+    if executor.extract_intent(run_id, planner) is AgentRunStatus.RECEIVED:
+        _resolve_and_execute(executor, run_id)
+    return run_id
+
+
+def _resolve_and_execute(executor: AgentExecutor, run_id: int) -> None:
     if executor.resolve_run(run_id) is not AgentRunStatus.RESOLVED:
-        return run_id
+        return
     goal = executor.get_goal(run_id)
 
     listing = executor.call_tool(run_id, ListUserAssignmentsInput(user_id=goal.user_id))
     if listing.run_status is not AgentRunStatus.EXECUTING:
-        return run_id
+        return
     # This only decides whether to attempt the change. It proves nothing:
     # the verifier reads current state again before the run can complete.
     already_assigned = isinstance(listing.output, UserAssignmentsSnapshot) and any(
@@ -49,13 +78,12 @@ def run_ensure_assignment(
             run_id, GetLicenceInput(licence_id=goal.licence_id)
         )
         if capacity.run_status is not AgentRunStatus.EXECUTING:
-            return run_id
+            return
         assignment = executor.call_tool(
             run_id,
             AssignLicenceInput(user_id=goal.user_id, licence_id=goal.licence_id),
         )
         if assignment.run_status is not AgentRunStatus.EXECUTING:
-            return run_id
+            return
 
     executor.verify_and_finish(run_id)
-    return run_id

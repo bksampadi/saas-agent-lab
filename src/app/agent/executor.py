@@ -19,6 +19,17 @@ crosses from one session to the next; only ids and plain values do.
 Model calls and tool calls take their sequence_no from one per-run counter,
 so a run's trace has a single order that never depends on timestamps.
 
+Extraction (a natural-language run, from receive_run) follows the same rule.
+The run is persisted RECEIVED before any model is called. The planner then
+runs with no session open, and each model request it makes is recorded in
+its own LOG transaction as soon as the request has an outcome:
+
+    LOG       ModelCall (per request, retries included)      COMMIT, close
+    LOG       run's goal, or its outcome                     COMMIT, close
+
+A crash during a model request leaves no row for it (the request changed no
+application state); the run stays RECEIVED without a goal.
+
 Known crash windows (no recovery yet): a crash after the business commit
 but before the ToolCall's outcome is written leaves the call STARTED; the
 change is still traceable to the run through its audit actor
@@ -32,11 +43,12 @@ compare-and-set.
 """
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, assert_never
 
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.agent import tools
+from app.agent.planner import IntentPlanner, PlannerError, ungrounded_fields
 from app.agent.resolver import resolve_assignment_goal
 from app.agent.status import transition
 from app.agent.verifier import verify
@@ -45,20 +57,29 @@ from app.models import (
     AgentRunStatus,
     DesiredState,
     GoalType,
+    ModelCall,
+    ModelCallStage,
+    ModelCallStatus,
     OutcomeReason,
     ToolCall,
     ToolCallStatus,
 )
 from app.models.base import utcnow
 from app.repositories.agent_runs import AgentRunRepository
+from app.repositories.model_calls import ModelCallRepository
 from app.repositories.tool_calls import ToolCallRepository
 from app.schemas.agent import (
+    EnsureAssignmentIntent,
     ExtractedAssignmentIntent,
+    ExtractedIntent,
+    ModelCallRecord,
+    NeedsClarification,
     ResolutionFailure,
     ResolvedAssignmentGoal,
     ToolError,
     ToolInput,
     ToolOutput,
+    Unsupported,
     VerificationResult,
 )
 from app.services.assignments import AssignmentService
@@ -241,6 +262,104 @@ def _validated_request(instruction: str, requesting_actor: str) -> str:
     return requesting_actor
 
 
+def _require_awaiting_extraction(run: AgentRun) -> None:
+    if run.status is not AgentRunStatus.RECEIVED or run.goal_type is not None:
+        raise RunNotExecutable(run.id, run.status)
+
+
+class _ModelCallLog:
+    """The ModelCallRecorder handed to a planner: each record() is one short
+    log transaction, and the call takes the run's next sequence_no."""
+
+    def __init__(
+        self, sessions: sessionmaker[Session], run_id: int, stage: ModelCallStage
+    ) -> None:
+        self._sessions = sessions
+        self._run_id = run_id
+        self._stage = stage
+
+    def record(self, call: ModelCallRecord) -> None:
+        with self._sessions.begin() as log:
+            calls = ModelCallRepository(log)
+            calls.add(
+                ModelCall(
+                    agent_run_id=self._run_id,
+                    sequence_no=calls.next_sequence_no(self._run_id),
+                    stage=self._stage,
+                    model_name=call.model_name,
+                    status=(
+                        ModelCallStatus.SUCCEEDED
+                        if call.error is None
+                        else ModelCallStatus.FAILED
+                    ),
+                    input_tokens=call.input_tokens,
+                    output_tokens=call.output_tokens,
+                    latency_ms=call.latency_ms,
+                    output=call.output,
+                    error=(
+                        None
+                        if call.error is None
+                        else call.error.model_dump(mode="json")
+                    ),
+                )
+            )
+
+
+def _record_extraction(
+    run: AgentRun, instruction: str, outcome: ExtractedIntent | PlannerError
+) -> None:
+    """Store an assignment intent as the run's goal, or end the run."""
+    match outcome:
+        case EnsureAssignmentIntent():
+            # The planner is asked to copy text, but whatever it is, text that
+            # is not in the instruction was invented and is never resolved.
+            missing = ungrounded_fields(outcome, instruction)
+            if missing:
+                transition(
+                    run,
+                    AgentRunStatus.FAILED,
+                    reason=OutcomeReason.PLANNER_ERROR,
+                    detail={
+                        "stage": ModelCallStage.EXTRACTION.value,
+                        "code": "ungrounded_output",
+                        "error_type": None,
+                        "fields": missing,
+                    },
+                )
+                return
+            run.goal_type = GoalType.ENSURE_ASSIGNMENT
+            run.desired_state = DesiredState.ASSIGNED
+            run.extracted_user_email = outcome.user_email
+            run.extracted_product = outcome.product
+        case NeedsClarification():
+            transition(
+                run,
+                AgentRunStatus.NEEDS_CLARIFICATION,
+                reason=OutcomeReason.INSTRUCTION_UNCLEAR,
+                detail={"reason_code": outcome.reason_code},
+            )
+        case Unsupported():
+            transition(
+                run,
+                AgentRunStatus.NEEDS_CLARIFICATION,
+                reason=OutcomeReason.UNSUPPORTED_REQUEST,
+                detail={"reason_code": outcome.reason_code},
+            )
+        case PlannerError():
+            transition(
+                run,
+                AgentRunStatus.FAILED,
+                reason=OutcomeReason.PLANNER_ERROR,
+                detail={
+                    "stage": ModelCallStage.EXTRACTION.value,
+                    "code": outcome.code,
+                    "error_type": outcome.error_type,
+                },
+            )
+        case _:
+            assert_never(outcome)
+
+
 class AgentExecutor:
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         self._sessions = session_factory
@@ -266,6 +385,39 @@ class AgentExecutor:
                 )
             )
             return run.id
+
+    def extract_intent(self, run_id: int, planner: IntentPlanner) -> AgentRunStatus:
+        """Ask ``planner`` what the run's instruction asks for, and record it.
+
+        An assignment intent becomes the run's goal, with its text stored
+        exactly as extracted; the run stays RECEIVED, ready for resolve_run.
+        NeedsClarification and Unsupported end the run NEEDS_CLARIFICATION
+        (instruction_unclear, unsupported_request). A PlannerError, or
+        extracted text that is not in the instruction, ends it FAILED
+        (planner_error). Nothing is resolved or attempted in any case.
+
+        Raises RunNotExecutable, calling nothing, unless the run is RECEIVED
+        and not yet extracted.
+        """
+        with self._sessions() as log:
+            run = self._get_run(log, run_id)
+            _require_awaiting_extraction(run)
+            instruction = run.instruction
+
+        calls = _ModelCallLog(self._sessions, run_id, ModelCallStage.EXTRACTION)
+        outcome: ExtractedIntent | PlannerError
+        try:
+            outcome = planner.plan(instruction, calls)
+        except PlannerError as error:
+            outcome = error
+        except Exception as error:
+            return self._fail(run_id, _unexpected_detail("extraction", error))
+
+        with self._sessions.begin() as log:
+            run = self._get_run(log, run_id)
+            _require_awaiting_extraction(run)
+            _record_extraction(run, instruction, outcome)
+            return run.status
 
     def create_run(
         self,

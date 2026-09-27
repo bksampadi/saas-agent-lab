@@ -1,14 +1,18 @@
-"""Contracts of the agent layer: the text a planner may hand in, the goal the
-resolver produces, tool arguments and results, and the verifier's result.
+"""Contracts of the agent layer: what a planner may extract from an
+instruction, the goal the resolver produces, tool arguments and results,
+model-call records, and the verifier's result.
 
 Tool results are structured facts read from the application at one moment
 (snapshots), never prose summaries. A later read may disagree with them.
+They are internal results for application code and carry row ids; they are
+never shown to a model as they are. Anything a model sees is a separate,
+id-free observation.
 """
 
 from datetime import datetime
 from typing import Annotated, Any, ClassVar, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from app.models import (
     Assignment,
@@ -25,6 +29,95 @@ from app.services.assignments import SeatUsage
 EXTRACTED_TEXT_MAX_LENGTH = 1000
 
 ExtractedText = Annotated[str, StringConstraints(max_length=EXTRACTED_TEXT_MAX_LENGTH)]
+
+
+# --- extraction ---------------------------------------------------------------
+#
+# What a planner may say an instruction asks for: exactly one of three closed
+# shapes. Text and reason codes only. There are no id fields and no free-form
+# fields, and extra="forbid" rejects any that are supplied, so a planner can
+# neither name rows nor carry anything the application did not ask for.
+
+
+class EnsureAssignmentIntent(BaseModel):
+    """The instruction asks for exactly one thing: that one user, identified
+    by an email address written in the instruction, holds a seat of one
+    product. Both values are copied from the instruction, never inferred."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal["ensure_assignment"] = "ensure_assignment"
+    user_email: ExtractedText
+    product: ExtractedText
+
+
+NeedsClarificationCode = Literal[
+    "missing_user_email",  # a user is named or described, but no email given
+    "missing_product",
+    "multiple_users",
+    "multiple_products",
+    "conflicting_request",  # the instruction contradicts itself
+]
+
+
+class NeedsClarification(BaseModel):
+    """The instruction asks for a licence assignment but cannot be carried
+    out as written."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal["needs_clarification"] = "needs_clarification"
+    reason_code: NeedsClarificationCode
+
+
+UnsupportedCode = Literal[
+    "unsupported_action",  # asks for something other than a licence assignment
+    "additional_request",  # an assignment plus anything else
+    "not_a_request",
+]
+
+
+class Unsupported(BaseModel):
+    """The instruction asks for something this agent does not do. The whole
+    instruction is refused; no part of it is carried out."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal["unsupported"] = "unsupported"
+    reason_code: UnsupportedCode
+
+
+ExtractedIntent = Annotated[
+    EnsureAssignmentIntent | NeedsClarification | Unsupported,
+    Field(discriminator="kind"),
+]
+
+
+# --- model calls --------------------------------------------------------------
+
+
+class ModelCallError(BaseModel):
+    """A failed or rejected model request, normalized like ToolError: a code,
+    a message written by the application, and the exception class name."""
+
+    model_config = ConfigDict(frozen=True)
+
+    code: str  # invalid_output, timeout, provider_error or unexpected_error
+    message: str
+    error_type: str | None
+
+
+class ModelCallRecord(BaseModel):
+    """One model request's outcome, as a planner reports it for persistence."""
+
+    model_config = ConfigDict(frozen=True)
+
+    model_name: str
+    input_tokens: int | None  # None if the request produced no response
+    output_tokens: int | None
+    latency_ms: int
+    output: dict[str, Any] | None  # the accepted structured output, as JSON
+    error: ModelCallError | None  # set exactly when output is None
 
 
 # --- resolution ---------------------------------------------------------------

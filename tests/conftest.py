@@ -1,5 +1,6 @@
 from collections.abc import Iterator
 
+import pydantic_ai.models
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine
@@ -9,6 +10,11 @@ from sqlalchemy.pool import StaticPool
 from app.core.database import create_db_engine, get_session
 from app.main import create_app
 from app.models import Base
+
+# No test may send a request to a real model provider, even with credentials
+# in the environment. PydanticAI's test models (TestModel, FunctionModel) are
+# not affected; every provider model raises before any network access.
+pydantic_ai.models.ALLOW_MODEL_REQUESTS = False
 
 
 @pytest.fixture

@@ -14,6 +14,10 @@ class Settings(BaseSettings):
 
     app_name: str = "SaaS Agent Lab"
     database_url: str = "sqlite:///./saas_agent_lab.db"
+    # "provider:model", as PydanticAI names models. The provider's own
+    # credentials (e.g. ANTHROPIC_API_KEY) are read by its SDK, not here.
+    planner_model: str = "anthropic:claude-sonnet-5"
+    planner_timeout_seconds: float = 30.0
 
 
 @lru_cache
