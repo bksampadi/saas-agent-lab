@@ -12,7 +12,7 @@ id-free observation.
 from datetime import datetime
 from typing import Annotated, Any, ClassVar, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 from app.models import (
     Assignment,
@@ -313,3 +313,66 @@ class VerificationResult(BaseModel):
 
     satisfied: bool
     evidence: VerificationEvidence
+
+
+# --- model-visible observations -----------------------------------------------
+#
+# A tool call's outcome as a model sees it: a separate, closed DTO built from
+# the internal result by app.agent.observations. It carries only what the
+# model needs to decide: no id field, no free-form field, no dictionary, and
+# extra="forbid" rejects anything not declared.
+
+
+class TargetUserObservation(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: UserStatus
+
+
+class LicenceCapacityObservation(BaseModel):
+    """Seats as counted when read: an observation, never a reservation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    seats_total: int
+    seats_active: int
+    seats_available: int
+
+
+class TargetAssignmentsObservation(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    # The target user holds an active seat of the target product. Other
+    # assignments are not needed for the decision and are not shown.
+    holds_active_seat: bool
+
+
+AssignmentRejectionCode = Literal[
+    "no_seats_available",
+    "user_inactive",
+    "already_assigned",  # the user already holds an active seat
+]
+
+
+class AssignmentAttemptObservation(BaseModel):
+    """The outcome of assign_target_licence. A rejection is described by a
+    closed code, never by an exception's message."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    outcome: Literal["assigned", "rejected"]
+    reason_code: AssignmentRejectionCode | None  # set exactly when rejected
+
+    @model_validator(mode="after")
+    def _reason_code_only_when_rejected(self) -> Self:
+        if (self.outcome == "rejected") != (self.reason_code is not None):
+            raise ValueError("reason_code is set exactly when outcome is rejected.")
+        return self
+
+
+ModelObservation = (
+    TargetUserObservation
+    | LicenceCapacityObservation
+    | TargetAssignmentsObservation
+    | AssignmentAttemptObservation
+)

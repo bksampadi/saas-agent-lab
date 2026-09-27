@@ -322,6 +322,40 @@ def test_a_run_with_tool_calls_cannot_be_deleted(session: Session) -> None:
         session.flush()
 
 
+@pytest.mark.parametrize(
+    "overrides", [VALID_CALLS["succeeded"], VALID_CALLS["failed"]], ids=["ok", "failed"]
+)
+def test_a_finished_tool_call_may_carry_an_observation(
+    session: Session, overrides: dict[str, Any]
+) -> None:
+    run = add_run(session)
+    session.add(tool_call(run.id, observation='{"x":1}', **overrides))
+    session.flush()
+
+
+def test_a_started_tool_call_has_no_observation(session: Session) -> None:
+    # A model sees a call's result only once the call has one.
+    run = add_run(session)
+    session.add(tool_call(run.id, observation="{}"))
+
+    with pytest.raises(IntegrityError):
+        session.flush()
+
+
+def test_an_observation_is_stored_byte_for_byte(session: Session) -> None:
+    run = add_run(session)
+    observation = '{"seats_active":2,"seats_available":0,"seats_total":2}'
+    call = tool_call(run.id, observation=observation, **VALID_CALLS["succeeded"])
+    session.add(call)
+    session.flush()
+
+    stored = session.execute(
+        text("SELECT observation FROM tool_calls WHERE id = :id"), {"id": call.id}
+    ).scalar_one()
+
+    assert stored == observation
+
+
 def test_tool_call_json_none_is_stored_as_sql_null(session: Session) -> None:
     run = add_run(session)
     call = tool_call(run.id, result=None, error=None)

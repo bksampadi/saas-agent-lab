@@ -2,7 +2,15 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from sqlalchemy import JSON, CheckConstraint, Enum, ForeignKey, String, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    CheckConstraint,
+    Enum,
+    ForeignKey,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, UTCDateTime, enum_values, utcnow
@@ -21,6 +29,10 @@ class ToolCall(Base):
     depends on timestamps. Runs execute their tool calls one at a time, so the
     executor assigns the next number; the unique constraint turns any
     accidental concurrent allocation into an error instead of a tie.
+
+    ``result`` and ``error`` are internal and may hold row ids.
+    ``observation`` is set only on a call a decision model made: the exact
+    text the model was given as the call's result, id-free by construction.
     """
 
     __tablename__ = "tool_calls"
@@ -39,6 +51,11 @@ class ToolCall(Base):
             "OR (status = 'failed' AND completed_at IS NOT NULL "
             "AND result IS NULL AND error IS NOT NULL)",
             name="outcome_matches_status",
+        ),
+        # A model sees a call's result only once the call has one.
+        CheckConstraint(
+            "observation IS NULL OR status != 'started'",
+            name="observation_needs_outcome",
         ),
     )
 
@@ -64,5 +81,8 @@ class ToolCall(Base):
     result: Mapped[dict[str, Any] | None] = mapped_column(JSON(none_as_null=True))
     # {"code", "message", "error_type"}: never a traceback or raw exception text.
     error: Mapped[dict[str, Any] | None] = mapped_column(JSON(none_as_null=True))
+    # Text, not JSON: stored exactly as sent, so it can be compared byte for
+    # byte with what crossed the model boundary.
+    observation: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
