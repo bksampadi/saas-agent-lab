@@ -10,9 +10,10 @@ Build the application layer first: explicit boundaries, persistent state, migrat
 - Day 1, deterministic agent execution foundation: complete. Persisted `AgentRun` and `ToolCall`, deterministic resolver, persisted resolved goal, goal-scoped executor with separate log and business transactions, audit actor `agent:run-<id>`, state-based verifier.
 - Day 2A, natural-language intent extraction: complete. PydanticAI turns an instruction into a closed `ExtractedIntent` union (`EnsureAssignmentIntent | NeedsClarification | Unsupported`). Every model request is persisted as a `ModelCall`; model calls and tool calls share one ordered trace per run.
 - Day 2B, bounded model-directed execution: complete. `AgentExecutor.decide` lets a model choose among four argument-free tools bound to the run's persisted goal (`agent/decision_tools.py`), executed through the Day 1 executor. The model concludes with a closed proposal (`GoalReached | NoActionNeeded | CannotProceed`). Id-free observations are persisted on each `ToolCall`, and the initial context on the run. Limits are enforced by application code (`step_limit`). The run's outcome comes from `decision.decision_outcome`, never from the proposal.
-- Next, Day 2C: not started. The live-provider test belongs there.
+- Day 2C, HTTP surface and live smoke test: complete. `POST /agent-runs` runs `harness.run_directed_instruction` synchronously through `agent/runs.py`; `GET /agent-runs/{run_id}` returns the persisted run, decision context, verification and ordered trace, id-free (`schemas/agent_runs.py`). One opt-in live test (`tests/live/`, marker `live`) drives a real model end to end.
+- Next: the rest of v0.3 (policy checks, approval checkpoints, cancellation). Not started.
 
-LLM and model integration is permitted, within the authority boundary below. `harness.run_instruction` still runs the deterministic Day 1 steps after extraction; `harness.run_directed_instruction` hands the resolved run to a decision planner.
+LLM and model integration is permitted, within the authority boundary below. `harness.run_instruction` still runs the deterministic Day 1 steps after extraction; `harness.run_directed_instruction` hands the resolved run to a decision planner, and is what the API runs.
 
 ## Authority boundary
 
@@ -31,7 +32,7 @@ A model's output is never evidence that something happened. Only the verifier, r
 
 - v0.1 SaaS application: CRUD, audit log, constraints, request transactions, tests, type checking
 - v0.2 agent execution foundation: persisted runs and tool calls, deterministic resolution, goal-scoped typed tools, traces, postcondition verification
-- v0.3 autonomous planning and human control: natural-language requests (Day 2A done), bounded model decisions and planner-visible observations (Day 2B done), policy checks, approval checkpoints, cancellation
+- v0.3 autonomous planning and human control: natural-language requests (Day 2A done), bounded model decisions and planner-visible observations (Day 2B done), agent-run HTTP surface and live smoke test (Day 2C done), policy checks, approval checkpoints, cancellation
 - v0.4 browser execution and operator UI: Playwright, agent runs and approvals in a web interface
 - v0.5 agent evaluation: frozen scenarios, state-based success, counter-evidence and observation coverage, model comparison, latency, tokens, cost
 - v0.6 production hardening: PostgreSQL, authentication/authorization, durable execution, idempotency, concurrency, retries, observability
@@ -52,7 +53,9 @@ A model's output is never evidence that something happened. Only the verifier, r
 - A model reaches the application only through a planner interface (`agent/planner.py`) with a fake-able implementation. Model output is a closed Pydantic union with `extra="forbid"`: no id fields, no free-form fields.
 - Every model request, accepted, rejected or failed, is persisted as a `ModelCall` as soon as it has an outcome. Retries are bounded by explicit constants.
 - `AgentRun.last_sequence_no` orders the trace and nothing else. It is not a limit.
-- Tests never send a real model request: `tests/conftest.py` sets `pydantic_ai.models.ALLOW_MODEL_REQUESTS = False`. Use `FunctionModel`, `TestModel` or a fake planner. No test needs an API key.
+- Tests never send a real model request: `tests/conftest.py` sets `pydantic_ai.models.ALLOW_MODEL_REQUESTS = False`. Use `FunctionModel`, `TestModel` or a fake planner. No test needs an API key. The one exception is the live smoke test (`tests/live/`): deselected by default (`-m 'not live'` in addopts), skipped without the provider key, and the only place the guard is lifted (`override_allow_model_requests`). Never add a second one, and never retry it.
+- Agent-run routes (`api/agent_runs.py`) are transport only and plain `def`. They take no request session or transaction: `agent/runs.py` gets the session factory (`deps.get_session_factory`). Planners are dependencies (`get_intent_planner`, `get_decision_planner`); API tests override them with scripted models.
+- The public API shows a run only through `schemas/agent_runs.py`: never a resolved id, tool arguments, internal results, error messages or raw `outcome_detail`. Expected agent outcomes are `201` with the outcome in the body, never an HTTP error. Verification is read from the `outcome_detail` persisted at the end of the run, never recomputed from current state.
 - Default model: `SAL_PLANNER_MODEL`, `anthropic:claude-sonnet-5`. Model comparison belongs to evaluation, not to defaults.
 
 ## Decision-stage rules
@@ -93,6 +96,7 @@ Python 3.12, uv, FastAPI, SQLAlchemy 2.x, Alembic, Pydantic v2, pydantic-setting
 uv sync
 uv run uvicorn app.main:app --reload
 uv run pytest
+uv run pytest -m live   # opt-in: real, billable model requests; needs ANTHROPIC_API_KEY
 uv run ruff check . && uv run ruff format .
 uv run pyright
 uv run alembic upgrade head

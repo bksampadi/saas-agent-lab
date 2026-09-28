@@ -6,7 +6,9 @@ The application provides users, licences, assignments, revocation and audit logg
 
 A language model (via PydanticAI) has two bounded jobs. First, it extracts what a natural-language instruction asks for into a closed, id-free intent, which goes to the deterministic resolver. Then, after resolution, it chooses which of four goal-bound tools to call, and when to stop. None of those tools takes an argument, so the application alone decides what they act on. Every model request, tool call and model-visible observation is persisted in the run's trace. Application state remains authoritative for identity, business rules, transaction success and goal satisfaction.
 
-**Status:** Agent execution foundation, natural-language intent extraction and bounded model-directed execution implemented. HTTP endpoints for agent runs, approvals and a live-provider test are not built yet.
+A small HTTP surface runs an instruction through that whole flow and returns the persisted run, including a trace of what the model was shown.
+
+**Status:** Agent execution foundation, natural-language intent extraction, bounded model-directed execution and synchronous agent-run endpoints implemented, with an opt-in live-model smoke test. Not production-ready: runs execute inside the request, with no background execution, crash recovery, approvals, policy checks or cancellation yet.
 
 ## Stack
 
@@ -38,6 +40,8 @@ environment variables; see [`.env.example`](.env.example).
 | `POST` | `/assignments` | Assign a licence seat to a user |
 | `GET` | `/assignments` | List active assignments |
 | `POST` | `/assignments/{assignment_id}/revoke` | Revoke an active assignment |
+| `POST` | `/agent-runs` | Run a natural-language instruction to a terminal status |
+| `GET` | `/agent-runs/{run_id}` | Fetch one run with its decision context, verification and trace |
 
 Mutating endpoints require an `X-Actor` header. Its value is recorded on the audit event as the actor responsible for the change.
 
@@ -50,6 +54,42 @@ curl -X POST http://127.0.0.1:8000/users \
   -d '{"email": "ada@example.com", "name": "Ada Lovelace"}'
 ```
 
+### Agent runs
+
+`POST /agent-runs` takes one instruction and runs it synchronously: extraction, deterministic resolution, the bounded decision loop and verification all happen before the response is sent. It needs the configured provider's API key (e.g. `ANTHROPIC_API_KEY`). Without one the application still starts, and a run ends `failed` with `planner_error`.
+
+```bash
+curl -X POST http://127.0.0.1:8000/agent-runs \
+  -H "X-Actor: admin@example.com" \
+  -H "Content-Type: application/json" \
+  -d '{"instruction": "Ensure ada@example.com has a GitHub Enterprise licence"}'
+```
+
+```json
+{
+  "id": 1,
+  "instruction": "Ensure ada@example.com has a GitHub Enterprise licence",
+  "requesting_actor": "admin@example.com",
+  "status": "completed",
+  "outcome_reason": "goal_satisfied",
+  "outcome_code": null,
+  "goal": {"kind": "ensure_assignment", "user_email": "ada@example.com", "product": "GitHub Enterprise"},
+  "decision_proposal": {"kind": "goal_reached"},
+  "created_at": "2026-09-28T10:15:02.114203Z",
+  "completed_at": "2026-09-28T10:15:09.871455Z"
+}
+```
+
+The response is `201` whenever a run was created, however it ended: `completed`, `blocked`, `needs_clarification` or `failed` is the run's outcome, not an HTTP error. `422` means no run was created (a malformed body, or a missing, blank or reserved `X-Actor`). The change itself is audited as `agent:run-<id>`, and the requesting actor is stored on the run.
+
+`GET /agent-runs/{run_id}` adds what the decision model was first told (`decision_context`), what the application verified at the end (`verification`), and the run's `trace`: model calls and tool calls in one order. A tool call appears under the model-facing tool name, with the exact observation the model was given:
+
+```json
+{"kind": "tool_call", "sequence_no": 5, "tool": "assign_target_licence", "status": "succeeded", "error_code": null, "observation": "{\"outcome\":\"assigned\",\"reason_code\":null}"}
+```
+
+The trace shows what the model was allowed to know. It is not a database snapshot: resolved user and licence ids, tool arguments, internal results and exception messages are never returned. Everything is read from what was persisted when it happened, never recomputed from current state.
+
 ## Test and lint
 
 ```bash
@@ -60,6 +100,28 @@ uv run pyright
 ```
 
 Tests use isolated SQLite databases and do not access production infrastructure or the network. Real model requests are blocked in tests, which use scripted models and need no API key.
+
+One optional smoke test sends a real instruction to the configured model through `POST /agent-runs`. `uv run pytest` never runs it. It runs only when you select it and the provider's key is set; otherwise it is skipped. Its requests are real and billable.
+
+Linux or macOS (the key is set for this one command):
+
+```bash
+ANTHROPIC_API_KEY=... uv run pytest -m live
+```
+
+Windows PowerShell (the key stays set for the rest of the session):
+
+```powershell
+$env:ANTHROPIC_API_KEY = "..."
+uv run pytest -m live
+```
+
+Windows Command Prompt (likewise for the session; no quotes or trailing spaces around the value):
+
+```bat
+set ANTHROPIC_API_KEY=...
+uv run pytest -m live
+```
 
 ## Architecture
 
@@ -73,7 +135,7 @@ flowchart LR
     Service --> Audit[Audit log]
     Audit --> DB
 
-    Instruction --> Planner[Intent extraction: PydanticAI]
+    API -->|POST /agent-runs| Planner[Intent extraction: PydanticAI]
     Planner --> ModelTrace[Model-call trace]
     Planner --> AgentRun[Agent execution]
     AgentRun --> Resolver[Deterministic resolver]
@@ -91,7 +153,7 @@ flowchart LR
 
 ```text
 src/app/
-  api/           # HTTP routes and request transaction boundary
+  api/           # HTTP routes, request transaction boundary, agent-run endpoints
   agent/         # planners, resolver, verifier, typed and goal-bound tools, observations, executor and harness
   schemas/       # Pydantic request/response and agent contracts
   services/      # business rules; never commit or roll back
@@ -105,7 +167,7 @@ tests/           # API, service, model, agent and migration tests
 
 Ordinary application requests flow `api → services → repositories → database`.
 
-Agent execution uses short, separate transaction boundaries so execution history survives failed business mutations. Agent-initiated mutations reuse the same application services and keep the business change and its audit event atomic.
+Agent execution uses short, separate transaction boundaries so execution history survives failed business mutations. Agent-initiated mutations reuse the same application services and keep the business change and its audit event atomic. The agent-run endpoints therefore take no request transaction. They run in a worker thread, and no transaction is open while a model is waited on.
 
 Model calls and tool calls share one per-run sequence, so a run's trace has a single order that never depends on timestamps.
 
