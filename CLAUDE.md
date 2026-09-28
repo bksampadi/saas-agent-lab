@@ -6,12 +6,14 @@ Build the application layer first: explicit boundaries, persistent state, migrat
 
 ## Current state
 
+Latest release: `v0.3.0` (everything below through Day 2C). `main` is in development toward the next milestone: version `0.4.0.dev0`.
+
 - v0.1 SaaS application: complete.
 - Day 1, deterministic agent execution foundation: complete. Persisted `AgentRun` and `ToolCall`, deterministic resolver, persisted resolved goal, goal-scoped executor with separate log and business transactions, audit actor `agent:run-<id>`, state-based verifier.
 - Day 2A, natural-language intent extraction: complete. PydanticAI turns an instruction into a closed `ExtractedIntent` union (`EnsureAssignmentIntent | NeedsClarification | Unsupported`). Every model request is persisted as a `ModelCall`; model calls and tool calls share one ordered trace per run.
 - Day 2B, bounded model-directed execution: complete. `AgentExecutor.decide` lets a model choose among four argument-free tools bound to the run's persisted goal (`agent/decision_tools.py`), executed through the Day 1 executor. The model concludes with a closed proposal (`GoalReached | NoActionNeeded | CannotProceed`). Id-free observations are persisted on each `ToolCall`, and the initial context on the run. Limits are enforced by application code (`step_limit`). The run's outcome comes from `decision.decision_outcome`, never from the proposal.
 - Day 2C, HTTP surface and live smoke test: complete. `POST /agent-runs` runs `harness.run_directed_instruction` synchronously through `agent/runs.py`; `GET /agent-runs/{run_id}` returns the persisted run, decision context, verification and ordered trace, id-free (`schemas/agent_runs.py`). One opt-in live test (`tests/live/`, marker `live`) drives a real model end to end.
-- Next: the rest of v0.3 (policy checks, approval checkpoints, cancellation). Not started.
+- Next: policy checks, approval checkpoints and cancellation, the first work after `v0.3.0` (see Roadmap). Not started.
 
 LLM and model integration is permitted, within the authority boundary below. `harness.run_instruction` still runs the deterministic Day 1 steps after extraction; `harness.run_directed_instruction` hands the resolved run to a decision planner, and is what the API runs.
 
@@ -30,13 +32,25 @@ A model's output is never evidence that something happened. Only the verifier, r
 
 ## Roadmap (do not skip ahead)
 
-- v0.1 SaaS application: CRUD, audit log, constraints, request transactions, tests, type checking
-- v0.2 agent execution foundation: persisted runs and tool calls, deterministic resolution, goal-scoped typed tools, traces, postcondition verification
-- v0.3 autonomous planning and human control: natural-language requests (Day 2A done), bounded model decisions and planner-visible observations (Day 2B done), agent-run HTTP surface and live smoke test (Day 2C done), policy checks, approval checkpoints, cancellation
-- v0.4 browser execution and operator UI: Playwright, agent runs and approvals in a web interface
-- v0.5 agent evaluation: frozen scenarios, state-based success, counter-evidence and observation coverage, model comparison, latency, tokens, cost
-- v0.6 production hardening: PostgreSQL, authentication/authorization, durable execution, idempotency, concurrency, retries, observability
-- v1.0 public release
+Released:
+
+- v0.1.0 SaaS application: CRUD, audit log, constraints, request transactions, tests, type checking
+- v0.2.0 agent execution foundation: persisted runs and tool calls, deterministic resolution, goal-scoped typed tools, traces, postcondition verification
+- v0.3.0 natural-language planning and bounded execution: intent extraction (Day 2A); bounded model-directed execution with id-free observations, deterministic verification and persisted model and tool traces (Day 2B); agent-run HTTP API and opt-in live-provider smoke test (Day 2C)
+
+Next milestone, in development on `main` (version `0.4.0.dev0`):
+
+1. policy checks
+2. approval checkpoints
+3. cancellation
+
+Later, in this order, not yet numbered:
+
+4. browser execution and operator UI: Playwright, agent runs and approvals in a web interface
+5. agent evaluation: frozen scenarios, state-based success, counter-evidence and observation coverage, model comparison, latency, tokens, cost
+6. production hardening: PostgreSQL, authentication/authorization, durable execution, idempotency, concurrency, retries, observability
+
+Then a public release.
 
 ## Architecture rules
 
@@ -88,7 +102,7 @@ Rules: a licence with no free seats cannot be assigned. Assigning a licence the 
 
 ## Stack
 
-Python 3.12, uv, FastAPI, SQLAlchemy 2.x, Alembic, Pydantic v2, pydantic-settings, PydanticAI (`pydantic-ai-slim[anthropic]`), pytest, httpx2 (test client), ruff, pyright. No frontend yet; the operator UI is planned for v0.4.
+Python 3.12, uv, FastAPI, SQLAlchemy 2.x, Alembic, Pydantic v2, pydantic-settings, PydanticAI (`pydantic-ai-slim[anthropic]`), pytest, httpx2 (test client), ruff, pyright. No frontend yet; the operator UI comes after policy checks, approvals and cancellation (see Roadmap).
 
 ## Commands
 
