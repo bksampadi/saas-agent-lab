@@ -4,10 +4,11 @@ agrees on."""
 
 import inspect
 import json
-from typing import get_args
+from typing import cast, get_args
 
 import pytest
 
+from app.agent import tools
 from app.agent.decision import (
     DECISION_INSTRUCTIONS,
     MAX_DECISION_MODEL_REQUESTS,
@@ -17,7 +18,8 @@ from app.agent.decision import (
     decision_outcome,
     decision_task,
 )
-from app.agent.decision_tools import GoalBoundTools
+from app.agent.decision_tools import MODEL_TOOL_NAMES, GoalBoundTools
+from app.agent.executor import AgentExecutor, ToolCallOutcome
 from app.agent.planner import TargetTools
 from app.agent.pydantic_ai_decision import PROPOSAL_TOOLS, TARGET_TOOLS
 from app.models import (
@@ -36,6 +38,7 @@ from app.schemas.agent import (
     NoActionNeeded,
     ResolvedAssignmentGoal,
     TargetToolName,
+    ToolInput,
 )
 
 S = AgentRunStatus
@@ -256,6 +259,42 @@ def test_every_layer_offers_the_same_four_tools() -> None:
     assert {tool.__name__ for tool in TARGET_TOOLS} == names
     assert public_methods(TargetTools) == names
     assert public_methods(GoalBoundTools) == names
+
+
+class RecordingExecutor:
+    """Stands in for AgentExecutor: records the call a goal-bound tool builds."""
+
+    def __init__(self) -> None:
+        self.tool_names: list[str] = []
+
+    def call_decision_tool(self, run_id: int, args: ToolInput) -> ToolCallOutcome:
+        self.tool_names.append(args.tool_name)
+        return ToolCallOutcome(
+            tool_call_id=1,
+            sequence_no=1,
+            output=None,
+            error=None,
+            run_status=AgentRunStatus.EXECUTING,
+            observation="{}",
+        )
+
+
+def test_each_tool_call_is_shown_under_the_model_facing_tool_that_made_it() -> None:
+    goal = ResolvedAssignmentGoal(
+        goal_type=GoalType.ENSURE_ASSIGNMENT,
+        desired_state=DesiredState.ASSIGNED,
+        user_id=48213,
+        licence_id=97531,
+        extracted_user_email="ada@example.com",
+        extracted_product="Figma",
+    )
+    executor = RecordingExecutor()
+    target_tools = GoalBoundTools(cast(AgentExecutor, executor), 7, goal)
+
+    for model_name in get_args(TargetToolName):
+        getattr(target_tools, model_name)()
+        assert MODEL_TOOL_NAMES[executor.tool_names[-1]] == model_name
+    assert set(MODEL_TOOL_NAMES) == {tool.tool_name for tool in tools.TOOL_INPUTS}
 
 
 def test_the_tools_take_nothing_but_the_run_context() -> None:

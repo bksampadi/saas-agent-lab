@@ -19,12 +19,23 @@ from app.schemas.agent import (
     GetUserInput,
     ListUserAssignmentsInput,
     ResolvedAssignmentGoal,
+    TargetToolName,
     ToolInput,
 )
 
 if TYPE_CHECKING:
     # Only for the annotation: the executor imports this module.
     from app.agent.executor import AgentExecutor
+
+# Each tool call is recorded under the internal tool's name; this is the
+# model-facing tool that makes it (see GoalBoundTools below), for showing a
+# trace in the model's own terms.
+MODEL_TOOL_NAMES: dict[str, TargetToolName] = {
+    GetUserInput.tool_name: "get_target_user",
+    GetLicenceInput.tool_name: "get_target_licence_capacity",
+    ListUserAssignmentsInput.tool_name: "list_target_user_assignments",
+    AssignLicenceInput.tool_name: "assign_target_licence",
+}
 
 
 class GoalBoundTools:
