@@ -9,7 +9,8 @@ def is_duplicate_product(error: IntegrityError) -> bool:
     """True only if ``error`` is the unique constraint on licences.product.
 
     SQLite reports the violated column, not the constraint name, so this
-    matches SQLite's exact message. Postgres will need its own check (v0.5).
+    matches SQLite's exact message. Postgres will need its own check
+    (production hardening).
     """
     return str(error.orig) == "UNIQUE constraint failed: licences.product"
 

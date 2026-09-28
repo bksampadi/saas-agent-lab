@@ -76,7 +76,7 @@ class AssignmentService:
         The seat check is count-then-insert: two concurrent requests can both
         see one free seat and both insert, overfilling the licence. Nothing in
         the database prevents that yet; it needs real coordination (e.g. row
-        locking) during production hardening (v0.5). Do not treat this as
+        locking) during production hardening. Do not treat this as
         concurrency-safe.
         """
         actor = validated_actor(actor)
@@ -135,7 +135,7 @@ class AssignmentService:
         assignment as active, and both would set revoked_at and write an
         audit event (the later timestamp wins on the row). Making the
         transition conditional in the database is deferred to production
-        hardening (v0.5).
+        hardening.
         """
         actor = validated_actor(actor)
 

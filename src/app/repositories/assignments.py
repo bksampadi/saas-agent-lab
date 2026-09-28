@@ -15,7 +15,7 @@ def is_duplicate_active_assignment(error: IntegrityError) -> bool:
     SQLite reports the violated columns, not the index name. That index is the
     only unique constraint on exactly these columns, so this exact message
     identifies it. Postgres reports the index name and will need its own check
-    (v0.5).
+    (production hardening).
     """
     return (
         str(error.orig)
