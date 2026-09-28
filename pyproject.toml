@@ -33,7 +33,11 @@ select = ["E", "F", "I", "B", "UP"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra --strict-markers --import-mode=importlib"
+# Live tests are deselected unless asked for by name: `pytest -m live`.
+addopts = "-ra --strict-markers --import-mode=importlib -m 'not live'"
+markers = [
+    "live: sends real, billable model requests; run only with `-m live` and the provider's API key set",
+]
 
 [tool.pyright]
 include = ["src", "tests"]
