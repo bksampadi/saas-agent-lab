@@ -12,6 +12,8 @@ class AgentRunStatus(StrEnum):
     RECEIVED = "received"
     RESOLVED = "resolved"
     EXECUTING = "executing"
+    # Paused before a mutation that policy says needs a person's approval.
+    AWAITING_APPROVAL = "awaiting_approval"
     VERIFYING = "verifying"
     COMPLETED = "completed"
     NEEDS_CLARIFICATION = "needs_clarification"
@@ -55,6 +57,7 @@ class OutcomeReason(StrEnum):
     # BLOCKED
     NO_SEATS_AVAILABLE = "no_seats_available"
     USER_INACTIVE = "user_inactive"
+    POLICY_DENIED = "policy_denied"  # policy denied the run's mutation
     # FAILED
     PLANNER_ERROR = "planner_error"  # at any model stage; the detail names it
     GOAL_SCOPE_VIOLATION = "goal_scope_violation"
@@ -123,23 +126,23 @@ class AgentRun(Base):
         CheckConstraint("last_sequence_no >= 0", name="last_sequence_no_non_negative"),
         # A failed run may have failed before or after resolution.
         CheckConstraint(
-            "(status IN ('resolved', 'executing', 'verifying', 'completed', "
-            "'blocked') AND resolved_user_id IS NOT NULL) "
+            "(status IN ('resolved', 'executing', 'awaiting_approval', "
+            "'verifying', 'completed', 'blocked') AND resolved_user_id IS NOT NULL) "
             "OR (status IN ('received', 'needs_clarification') "
             "AND resolved_user_id IS NULL) "
             "OR status = 'failed'",
             name="resolved_ids_match_status",
         ),
         CheckConstraint(
-            "(completed_at IS NULL) = "
-            "(status IN ('received', 'resolved', 'executing', 'verifying'))",
+            "(completed_at IS NULL) = (status IN ('received', 'resolved', "
+            "'executing', 'awaiting_approval', 'verifying'))",
             name="completed_at_iff_terminal",
         ),
         # "IS NOT NULL" is needed: NULL IN (...) is NULL, and a CHECK that
         # evaluates to NULL passes, so a terminal run with no reason would.
         CheckConstraint(
-            "(status IN ('received', 'resolved', 'executing', 'verifying') "
-            "AND outcome_reason IS NULL) "
+            "(status IN ('received', 'resolved', 'executing', 'awaiting_approval', "
+            "'verifying') AND outcome_reason IS NULL) "
             "OR (outcome_reason IS NOT NULL AND ("
             "(status = 'completed' "
             "AND outcome_reason IN ('goal_satisfied', 'already_satisfied')) "
@@ -147,8 +150,8 @@ class AgentRun(Base):
             "('unsupported_request', 'instruction_unclear', "
             "'invalid_input', 'user_not_found', 'licence_not_found', "
             "'licence_ambiguous')) "
-            "OR (status = 'blocked' "
-            "AND outcome_reason IN ('no_seats_available', 'user_inactive')) "
+            "OR (status = 'blocked' AND outcome_reason IN "
+            "('no_seats_available', 'user_inactive', 'policy_denied')) "
             "OR (status = 'failed' AND outcome_reason IN ('planner_error', "
             "'goal_scope_violation', 'tool_failed', 'verification_failed', "
             "'step_limit', 'unexpected_error'))))",

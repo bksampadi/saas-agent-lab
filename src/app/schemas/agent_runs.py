@@ -8,7 +8,8 @@ happened; nothing is re-derived from current application state.
 
 The trace shows the run as its models knew it: each model request with its
 accepted output, and each tool call under the model-facing name that made it,
-with the exact observation the model was given.
+with the exact observation the model was given, and, for a mutation, what
+policy decided when the call was admitted.
 """
 
 from datetime import datetime
@@ -28,6 +29,7 @@ from app.models import (
     ModelCallStage,
     ModelCallStatus,
     OutcomeReason,
+    PolicyDecision,
     ToolCall,
     ToolCallStatus,
 )
@@ -185,7 +187,9 @@ class ModelCallTraceEntry(BaseModel):
 class ToolCallTraceEntry(BaseModel):
     """One tool call, by the model-facing tool that made it. ``observation``
     is the exact text the model was given, or None if it was given nothing
-    (a refused call, or a failure that ended the run)."""
+    (a refused or denied call, a call held for approval, or a failure that
+    ended the run). ``policy`` is what policy decided when the call was
+    admitted: None for a read, and for a call refused before policy."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -193,6 +197,7 @@ class ToolCallTraceEntry(BaseModel):
     sequence_no: int
     tool: TargetToolName
     status: ToolCallStatus
+    policy: PolicyDecision | None
     error_code: str | None
     observation: str | None
 
@@ -202,6 +207,7 @@ class ToolCallTraceEntry(BaseModel):
             sequence_no=call.sequence_no,
             tool=MODEL_TOOL_NAMES[call.tool_name],
             status=call.status,
+            policy=call.policy_decision,
             error_code=None if call.error is None else call.error["code"],
             observation=call.observation,
         )

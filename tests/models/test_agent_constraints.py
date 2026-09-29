@@ -16,6 +16,7 @@ from app.models import (
     GoalType,
     Licence,
     OutcomeReason,
+    PolicyDecision,
     ToolCall,
     ToolCallStatus,
     User,
@@ -118,6 +119,12 @@ VALID_ROWS = {
         **resolved(ids),
         **terminal(R.NO_SEATS_AVAILABLE),
     },
+    "awaiting-approval": lambda ids: {"status": S.AWAITING_APPROVAL, **resolved(ids)},
+    "blocked-by-policy": lambda ids: {
+        "status": S.BLOCKED,
+        **resolved(ids),
+        **terminal(R.POLICY_DENIED),
+    },
     "failed-before-resolution": lambda ids: {
         "status": S.FAILED,
         **terminal(R.UNEXPECTED_ERROR),
@@ -189,6 +196,29 @@ INVALID_ROWS = {
         "status": S.RESOLVED,
         "resolved_user_id": 999,
         "resolved_licence_id": ids[1],
+    },
+    # A paused run: resolved, not terminal.
+    "awaiting-approval-without-ids": lambda ids: {"status": S.AWAITING_APPROVAL},
+    "awaiting-approval-with-completed-at": lambda ids: {
+        "status": S.AWAITING_APPROVAL,
+        **resolved(ids),
+        "completed_at": NOW,
+    },
+    "awaiting-approval-with-reason": lambda ids: {
+        "status": S.AWAITING_APPROVAL,
+        **resolved(ids),
+        **terminal(R.POLICY_DENIED),
+    },
+    # policy_denied blocks a run; it never completes or fails one.
+    "completed-with-policy-denied": lambda ids: {
+        "status": S.COMPLETED,
+        **resolved(ids),
+        **terminal(R.POLICY_DENIED),
+    },
+    "failed-with-policy-denied": lambda ids: {
+        "status": S.FAILED,
+        **resolved(ids),
+        **terminal(R.POLICY_DENIED),
     },
 }
 
@@ -354,6 +384,115 @@ def test_an_observation_is_stored_byte_for_byte(session: Session) -> None:
     ).scalar_one()
 
     assert stored == observation
+
+
+# --- tool_calls: policy decisions and held calls ------------------------------
+
+AWAITING = ToolCallStatus.AWAITING_APPROVAL
+STARTED = ToolCallStatus.STARTED
+ALLOW = PolicyDecision.ALLOW
+REQUIRE = PolicyDecision.REQUIRE_APPROVAL
+DENY = PolicyDecision.DENY
+ASSIGN = {"tool_name": "assign_licence", "arguments": {"user_id": 1, "licence_id": 2}}
+
+VALID_POLICY_CALLS: dict[str, dict[str, Any]] = {
+    "read-without-a-decision": {},
+    "allowed-and-started": {**ASSIGN, "policy_decision": ALLOW},
+    "denied-and-failed": {
+        **ASSIGN,
+        "policy_decision": DENY,
+        **VALID_CALLS["failed"],
+    },
+    "held-for-approval": {**ASSIGN, "status": AWAITING, "policy_decision": REQUIRE},
+    # Once approved (later), a held call runs like any other.
+    "required-approval-then-started": {**ASSIGN, "policy_decision": REQUIRE},
+    "required-approval-then-succeeded": {
+        **ASSIGN,
+        "policy_decision": REQUIRE,
+        **VALID_CALLS["succeeded"],
+    },
+}
+
+INVALID_POLICY_CALLS: dict[str, dict[str, Any]] = {
+    # The NULL case explicitly: NULL = 'require_approval' is NULL, which a
+    # CHECK would let through without its IS NOT NULL.
+    "held-without-a-decision": {**ASSIGN, "status": AWAITING},
+    "held-though-allowed": {**ASSIGN, "status": AWAITING, "policy_decision": ALLOW},
+    "held-though-denied": {**ASSIGN, "status": AWAITING, "policy_decision": DENY},
+    "held-with-completed-at": {
+        **ASSIGN,
+        "status": AWAITING,
+        "policy_decision": REQUIRE,
+        "completed_at": NOW,
+    },
+    "held-with-result": {
+        **ASSIGN,
+        "status": AWAITING,
+        "policy_decision": REQUIRE,
+        "result": {"a": 1},
+    },
+    "held-with-error": {
+        **ASSIGN,
+        "status": AWAITING,
+        "policy_decision": REQUIRE,
+        "error": ERROR,
+    },
+    "held-with-observation": {
+        **ASSIGN,
+        "status": AWAITING,
+        "policy_decision": REQUIRE,
+        "observation": "{}",
+    },
+    "denied-but-started": {**ASSIGN, "status": STARTED, "policy_decision": DENY},
+    "denied-but-succeeded": {
+        **ASSIGN,
+        "policy_decision": DENY,
+        **VALID_CALLS["succeeded"],
+    },
+}
+
+
+@pytest.mark.parametrize(
+    "overrides", VALID_POLICY_CALLS.values(), ids=VALID_POLICY_CALLS
+)
+def test_consistent_policy_decisions_are_accepted(
+    session: Session, overrides: dict[str, Any]
+) -> None:
+    run = add_run(session)
+    session.add(tool_call(run.id, **overrides))
+    session.flush()
+
+
+@pytest.mark.parametrize(
+    "overrides", INVALID_POLICY_CALLS.values(), ids=INVALID_POLICY_CALLS
+)
+def test_inconsistent_policy_decisions_are_rejected(
+    session: Session, overrides: dict[str, Any]
+) -> None:
+    run = add_run(session)
+    session.add(tool_call(run.id, **overrides))
+
+    with pytest.raises(IntegrityError):
+        session.flush()
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [("policy_decision", "sometimes"), ("status", "paused")],
+)
+def test_tool_call_enums_reject_unknown_values(
+    session: Session, column: str, value: str
+) -> None:
+    run = add_run(session)
+    call = tool_call(run.id)
+    session.add(call)
+    session.flush()
+
+    with pytest.raises(IntegrityError):
+        session.execute(
+            text(f"UPDATE tool_calls SET {column} = :value WHERE id = :id"),
+            {"value": value, "id": call.id},
+        )
 
 
 def test_tool_call_json_none_is_stored_as_sql_null(session: Session) -> None:

@@ -29,6 +29,7 @@ from app.models import (
     DesiredState,
     GoalType,
     OutcomeReason,
+    UserStatus,
 )
 from app.schemas.agent import (
     CannotProceed,
@@ -39,6 +40,7 @@ from app.schemas.agent import (
     ResolvedAssignmentGoal,
     TargetToolName,
     ToolInput,
+    UserSnapshot,
 )
 
 S = AgentRunStatus
@@ -269,10 +271,13 @@ class RecordingExecutor:
 
     def call_decision_tool(self, run_id: int, args: ToolInput) -> ToolCallOutcome:
         self.tool_names.append(args.tool_name)
+        # Any successful outcome will do: only the tool name is checked.
         return ToolCallOutcome(
             tool_call_id=1,
             sequence_no=1,
-            output=None,
+            output=UserSnapshot(
+                user_id=1, email="ada@example.com", name="Ada", status=UserStatus.ACTIVE
+            ),
             error=None,
             run_status=AgentRunStatus.EXECUTING,
             observation="{}",

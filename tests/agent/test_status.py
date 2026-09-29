@@ -31,7 +31,10 @@ def test_transition_table_is_exactly_the_approved_one() -> None:
     assert ALLOWED_TRANSITIONS == {
         S.RECEIVED: {S.RESOLVED, S.NEEDS_CLARIFICATION, S.FAILED},
         S.RESOLVED: {S.EXECUTING, S.FAILED},
-        S.EXECUTING: {S.VERIFYING, S.BLOCKED, S.FAILED},
+        # AWAITING_APPROVAL: policy held a mutation, before it ran.
+        S.EXECUTING: {S.AWAITING_APPROVAL, S.VERIFYING, S.BLOCKED, S.FAILED},
+        # Not terminal, but nothing leaves it until approval exists.
+        S.AWAITING_APPROVAL: set(),
         # BLOCKED from VERIFYING: a model-directed run's block is established
         # by the application only after verification finds the goal unmet.
         S.VERIFYING: {S.COMPLETED, S.BLOCKED, S.FAILED},
@@ -44,6 +47,23 @@ def test_transition_table_is_exactly_the_approved_one() -> None:
 
 def test_completed_is_reachable_only_from_verifying() -> None:
     assert [s for s in ALL if S.COMPLETED in ALLOWED_TRANSITIONS[s]] == [S.VERIFYING]
+
+
+def test_awaiting_approval_is_reachable_only_from_executing_and_is_not_terminal() -> (
+    None
+):
+    assert [s for s in ALL if S.AWAITING_APPROVAL in ALLOWED_TRANSITIONS[s]] == [
+        S.EXECUTING
+    ]
+    assert S.AWAITING_APPROVAL not in TERMINAL_STATUSES
+
+
+def test_policy_denied_is_a_blocking_reason_only() -> None:
+    assert [
+        status
+        for status, reasons in REASONS_BY_STATUS.items()
+        if OutcomeReason.POLICY_DENIED in reasons
+    ] == [S.BLOCKED]
 
 
 @pytest.mark.parametrize(("current", "to"), ALLOWED, ids=pair_id)

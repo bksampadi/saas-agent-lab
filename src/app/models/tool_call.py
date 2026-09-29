@@ -14,10 +14,14 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, UTCDateTime, enum_values, utcnow
+from app.models.licence import PolicyDecision
 
 
 class ToolCallStatus(StrEnum):
-    STARTED = "started"
+    # Held before it runs: policy requires a person's approval. No business
+    # transaction has opened for it.
+    AWAITING_APPROVAL = "awaiting_approval"
+    STARTED = "started"  # its business transaction may have opened
     SUCCEEDED = "succeeded"
     FAILED = "failed"
 
@@ -33,6 +37,9 @@ class ToolCall(Base):
     ``result`` and ``error`` are internal and may hold row ids.
     ``observation`` is set only on a call a decision model made: the exact
     text the model was given as the call's result, id-free by construction.
+    ``policy_decision`` is what policy decided when the call was admitted
+    (app.agent.policy): set for a mutating call that passed the goal-scope
+    and limit checks, NULL for a read and for a call refused before policy.
     """
 
     __tablename__ = "tool_calls"
@@ -44,7 +51,7 @@ class ToolCall(Base):
         ),
         CheckConstraint("sequence_no >= 1", name="sequence_no_positive"),
         CheckConstraint(
-            "(status = 'started' AND completed_at IS NULL "
+            "(status IN ('awaiting_approval', 'started') AND completed_at IS NULL "
             "AND result IS NULL AND error IS NULL) "
             "OR (status = 'succeeded' AND completed_at IS NOT NULL "
             "AND result IS NOT NULL AND error IS NULL) "
@@ -54,8 +61,22 @@ class ToolCall(Base):
         ),
         # A model sees a call's result only once the call has one.
         CheckConstraint(
-            "observation IS NULL OR status != 'started'",
+            "observation IS NULL OR status NOT IN ('awaiting_approval', 'started')",
             name="observation_needs_outcome",
+        ),
+        # A call waits for approval only when policy required it. "IS NOT
+        # NULL" is needed: NULL = 'require_approval' is NULL, and a CHECK
+        # that evaluates to NULL passes, so a NULL decision would.
+        CheckConstraint(
+            "status != 'awaiting_approval' OR (policy_decision IS NOT NULL "
+            "AND policy_decision = 'require_approval')",
+            name="awaiting_approval_was_required",
+        ),
+        # A denied call never runs. A NULL decision (a read, or a call refused
+        # before policy) takes the first branch explicitly.
+        CheckConstraint(
+            "policy_decision IS NULL OR policy_decision != 'deny' OR status = 'failed'",
+            name="denied_call_failed",
         ),
     )
 
@@ -75,7 +96,17 @@ class ToolCall(Base):
             native_enum=False,
             create_constraint=True,
             values_callable=enum_values,
-            length=16,
+            length=32,
+        )
+    )
+    policy_decision: Mapped[PolicyDecision | None] = mapped_column(
+        Enum(
+            PolicyDecision,
+            name="policy_decision",
+            native_enum=False,
+            create_constraint=True,
+            values_callable=enum_values,
+            length=32,
         )
     )
     result: Mapped[dict[str, Any] | None] = mapped_column(JSON(none_as_null=True))

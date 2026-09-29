@@ -1,4 +1,5 @@
-"""Runs of one ensure-assignment goal, from start to a terminal status.
+"""Runs of one ensure-assignment goal, from start to a terminal status, or
+to an approval pause if policy holds the run's mutation (AWAITING_APPROVAL).
 
 ``run_ensure_assignment`` and ``run_instruction`` are deterministic: test
 scaffolding and the reference path, not a planner. Every step goes through
@@ -31,7 +32,8 @@ def run_ensure_assignment(
     requesting_actor: str,
     intent: ExtractedAssignmentIntent,
 ) -> int:
-    """Drive one run to a terminal status and return its id."""
+    """Drive one run to a terminal status or an approval pause, and return
+    its id."""
     run_id = executor.create_run(
         instruction=instruction, requesting_actor=requesting_actor, intent=intent
     )
@@ -46,7 +48,8 @@ def run_instruction(
     instruction: str,
     requesting_actor: str,
 ) -> int:
-    """Drive one natural-language run to a terminal status and return its id.
+    """Drive one natural-language run to a terminal status or an approval
+    pause, and return its id.
 
     Only an extracted assignment intent goes on to resolution; any other
     extraction outcome has already ended the run, with nothing attempted.
@@ -67,8 +70,9 @@ def run_directed_instruction(
     instruction: str,
     requesting_actor: str,
 ) -> int:
-    """Drive one natural-language run to a terminal status, letting
-    ``decision_planner`` choose its tool calls, and return its id.
+    """Drive one natural-language run to a terminal status or an approval
+    pause, letting ``decision_planner`` choose its tool calls, and return
+    its id.
 
     Extraction and resolution are exactly as in run_instruction; only a
     RESOLVED run reaches the decision stage.

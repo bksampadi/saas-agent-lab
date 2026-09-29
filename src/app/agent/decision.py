@@ -56,13 +56,23 @@ class DecisionLimitExceeded(DecisionStopped):
 
 
 class RunEndedDuringDecision(DecisionStopped):
-    """A tool call failed in a way the model is not shown, and that failure
-    ended the run (as it ends a deterministic run)."""
+    """A tool call ended the run in a way the model is not shown: a failure
+    (as it ends a deterministic run), or a mutation policy denied."""
 
     def __init__(self, run_id: int, status: AgentRunStatus) -> None:
         super().__init__(f"Agent run {run_id} ended {status} during a tool call.")
         self.run_id = run_id
         self.status = status
+
+
+class RunAwaitingApproval(DecisionStopped):
+    """Policy held the model's mutation for a person's approval, unrun, and
+    paused the run. The model is not asked anything more: nothing it says
+    could change the pause."""
+
+    def __init__(self, run_id: int) -> None:
+        super().__init__(f"Agent run {run_id} is awaiting approval.")
+        self.run_id = run_id
 
 
 # --- what the model is told ---------------------------------------------------

@@ -6,12 +6,13 @@ persisted goal and goes through AgentExecutor.call_decision_tool: the same
 path as a deterministic call (goal-scope check, ToolCall trace, business
 transaction, audit actor "agent:run-<id>"), plus the decision limits and the
 observation boundary. The model gets back only the call's persisted
-observation, never the internal result.
+observation, never the internal result. A call policy denies or holds for
+approval gives it nothing, and stops its loop.
 """
 
 from typing import TYPE_CHECKING
 
-from app.agent.decision import RunEndedDuringDecision
+from app.agent.decision import RunAwaitingApproval, RunEndedDuringDecision
 from app.models import AgentRunStatus
 from app.schemas.agent import (
     AssignLicenceInput,
@@ -69,10 +70,14 @@ class GoalBoundTools:
     def _call(self, args: ToolInput) -> str:
         # May raise DecisionLimitExceeded: the call was refused and recorded.
         outcome = self._executor.call_decision_tool(self._run_id, args)
+        if outcome.run_status is AgentRunStatus.AWAITING_APPROVAL:
+            # Held for approval, unrun: there is no result to show.
+            raise RunAwaitingApproval(self._run_id)
         if (
             outcome.observation is None
             or outcome.run_status is not AgentRunStatus.EXECUTING
         ):
-            # A failure the model is not shown, which ended the run.
+            # A failure the model is not shown, or a denied mutation, which
+            # ended the run.
             raise RunEndedDuringDecision(self._run_id, outcome.run_status)
         return outcome.observation

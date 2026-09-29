@@ -60,6 +60,7 @@ from app.models import (
     Base,
     GoalType,
     Licence,
+    PolicyDecision,
     ToolCall,
     User,
     UserStatus,
@@ -226,10 +227,15 @@ def seed(
     seats: int = 5,
     held_by_others: int = 0,
     ada_holds: bool = False,
+    agent_policy: PolicyDecision = PolicyDecision.ALLOW,
 ) -> None:
     with sessions.begin() as session:
         session.add(User(id=ADA, email=EMAIL, name="Ada", status=UserStatus.ACTIVE))
-        session.add(Licence(id=GHE, product=PRODUCT, seats_total=seats))
+        session.add(
+            Licence(
+                id=GHE, product=PRODUCT, seats_total=seats, agent_policy=agent_policy
+            )
+        )
         session.flush()
         if ada_holds:
             session.add(Assignment(id=HELD, user_id=ADA, licence_id=GHE))
@@ -341,6 +347,85 @@ def test_a_confirmed_lack_of_seats_blocks_the_run_without_a_change(
     }
     assert count(api.sessions, Assignment) == 1  # only the other user's
     assert count(api.sessions, AuditEvent) == 0
+
+
+def test_a_mutation_policy_holds_pauses_the_run_for_approval(api: AgentApi) -> None:
+    seed(api.sessions, agent_policy=PolicyDecision.REQUIRE_APPROVAL)
+    api.extraction.will(extracted())
+    api.decision.will(call(ASSIGNMENTS), call(ASSIGN), GOAL_REACHED)
+
+    response = api.post()
+
+    # An expected outcome: 201, with the pause in the body.
+    assert response.status_code == 201
+    body = response.json()
+    assert outcome(body) == ("awaiting_approval", None, None)
+    assert (body["decision_proposal"], body["completed_at"]) == (None, None)
+    detail = api.detail(body["id"])
+    assert detail["verification"] is None
+    assert [e for e in detail["trace"] if e["kind"] == "tool_call"][-1] == {
+        "kind": "tool_call",
+        "sequence_no": 5,
+        "tool": ASSIGN,
+        "status": "awaiting_approval",
+        "policy": "require_approval",
+        "error_code": None,
+        "observation": None,
+    }
+    assert api.decision.steps == [GOAL_REACHED]  # the model was asked no more
+    assert (count(api.sessions, Assignment), count(api.sessions, AuditEvent)) == (0, 0)
+
+
+def test_a_mutation_policy_denies_blocks_the_run(api: AgentApi) -> None:
+    seed(api.sessions, agent_policy=PolicyDecision.DENY)
+    api.extraction.will(extracted())
+    api.decision.will(call(ASSIGN), GOAL_REACHED)
+
+    body = api.run()
+
+    assert outcome(body) == ("blocked", "policy_denied", None)
+    assert body["decision_proposal"] is None
+    detail = api.detail(body["id"])
+    assert detail["verification"] is None  # ended at admission, not verified
+    assert [e for e in detail["trace"] if e["kind"] == "tool_call"] == [
+        {
+            "kind": "tool_call",
+            "sequence_no": 3,
+            "tool": ASSIGN,
+            "status": "failed",
+            "policy": "deny",
+            "error_code": "policy_denied",
+            "observation": None,
+        }
+    ]
+    assert api.decision.steps == [GOAL_REACHED]
+    assert (count(api.sessions, Assignment), count(api.sessions, AuditEvent)) == (0, 0)
+
+
+@pytest.mark.parametrize(
+    "agent_policy", [PolicyDecision.DENY, PolicyDecision.REQUIRE_APPROVAL]
+)
+def test_a_policy_stop_shows_no_internal_id_arguments_or_message(
+    api: AgentApi, agent_policy: PolicyDecision
+) -> None:
+    seed(api.sessions, agent_policy=agent_policy)
+    api.extraction.will(extracted())
+    api.decision.will(call(ASSIGN))
+    created = api.post()
+    fetched = api.get(created.json()["id"])
+
+    with api.sessions() as session:
+        (held_or_denied,) = session.scalars(select(ToolCall)).all()
+        run = session.get(AgentRun, created.json()["id"])
+    # The internals hold the ids (and, when denied, a message and detail).
+    assert held_or_denied.arguments == {"user_id": ADA, "licence_id": GHE}
+    assert run is not None and run.resolved_licence_id == GHE
+    for response in (created, fetched):
+        assert response.status_code in (200, 201)
+        for internal in (str(ADA), str(GHE), "user_id", "licence_id", "message"):
+            assert internal not in response.text
+        # No field of that name (the instructions may use the word).
+        assert '"arguments"' not in response.text
 
 
 def test_a_false_success_claim_fails_verification(api: AgentApi) -> None:
@@ -581,9 +666,12 @@ def test_get_returns_the_persisted_trace_in_order_as_the_model_saw_it(
         "sequence_no": 3,
         "tool": ASSIGN,
         "status": "failed",
+        # Admitted by policy, then rejected by the domain rule.
+        "policy": "allow",
         "error_code": "no_seats_available",
         "observation": '{"outcome":"rejected","reason_code":"no_seats_available"}',
     }
+    assert trace[4]["policy"] is None  # a read: policy does not govern it
     assert trace[5]["output"] == {
         "kind": "cannot_proceed",
         "reason_code": "no_seats_available",

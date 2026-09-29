@@ -40,7 +40,8 @@ class AgentRuns:
         intent_planner: IntentPlanner,
         decision_planner: DecisionPlanner,
     ) -> AgentRunRecord:
-        """Drive one natural-language run to a terminal status and return it.
+        """Drive one natural-language run to a terminal status, or to an
+        approval pause (AWAITING_APPROVAL), and return it.
 
         Raises InvalidInput, recording nothing, for a blank or over-long
         instruction or an invalid requesting actor. Once the run exists, an

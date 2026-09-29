@@ -16,6 +16,17 @@ So a rolled-back change leaves the run's history intact, and on SQLite no
 log write holds a lock while a business write waits for it. No ORM object
 crosses from one session to the next; only ids and plain values do.
 
+The first LOG transaction admits the call: the run's status, its goal
+scope and the run's limits are checked, and then, for a mutation, policy
+(app.agent.policy), which reads the target licence in that same
+transaction. The decision is recorded with the call. A call policy denies
+is recorded FAILED (policy_denied) and ends the run BLOCKED; one policy
+holds for approval is recorded AWAITING_APPROVAL and pauses the run
+(AWAITING_APPROVAL). Neither opens a business transaction. The policy read
+and the recorded decision are atomic together, not with the business
+transaction that runs an admitted call afterwards: policy is decided at
+admission.
+
 Model calls and tool calls take their sequence_no from one per-run counter,
 so a run's trace has a single order that never depends on timestamps.
 
@@ -53,7 +64,8 @@ verification (UnfinishedToolCall), so it is never retried blindly or
 labelled without knowing whether it made a change. A crash during a
 decision loop leaves the run EXECUTING with its trace so far; one after an
 over-limit tool call is recorded, before decide ends the run, leaves that
-refused call in it, and the same limit refuses any later one.
+refused call in it, and the same limit refuses any later one. A paused
+run's held call stays AWAITING_APPROVAL; nothing resumes it yet.
 
 Tool calls within a run are serial. Nothing here coordinates concurrent
 callers on the same run: the status checks are read-then-write, not
@@ -65,13 +77,14 @@ from typing import Any, assert_never
 
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.agent import observations, tools
+from app.agent import observations, policy, tools
 from app.agent.decision import (
     MAX_DECISION_MODEL_REQUESTS,
     MAX_DECISION_MUTATION_CALLS,
     MAX_DECISION_READ_CALLS,
     DecisionLimit,
     DecisionLimitExceeded,
+    RunAwaitingApproval,
     RunEndedDuringDecision,
     decision_context,
     decision_outcome,
@@ -97,6 +110,7 @@ from app.models import (
     ModelCallStage,
     ModelCallStatus,
     OutcomeReason,
+    PolicyDecision,
     ToolCall,
     ToolCallStatus,
 )
@@ -143,6 +157,7 @@ INSTRUCTION_MAX_LENGTH = 2000
 
 GOAL_SCOPE_VIOLATION = "goal_scope_violation"
 STEP_LIMIT = "step_limit"
+POLICY_DENIED = "policy_denied"
 UNEXPECTED_ERROR = "unexpected_error"
 
 _DOMAIN_ERROR_CODES: dict[type[DomainError], str] = {
@@ -205,15 +220,35 @@ class UnfinishedToolCall(RunNotExecutable):
 
 @dataclass(frozen=True)
 class ToolCallOutcome:
+    """What one tool call came to.
+
+    A call that ran, or was refused, has exactly one of ``output`` and
+    ``error``. A call held for approval has neither, and only then: its
+    ``run_status`` is AWAITING_APPROVAL. So an outcome with neither is never
+    an empty success; construction refuses any other combination.
+    """
+
     tool_call_id: int
     sequence_no: int
     output: ToolOutput | None  # set if the call succeeded
-    error: ToolError | None  # set if it failed
+    error: ToolError | None  # set if it failed or was refused
     run_status: AgentRunStatus  # the run's status after the call
     # A decision call's persisted observation: the only part of the outcome
     # a model is given. None for a deterministic call, and for a failure the
     # model is not shown.
     observation: str | None = None
+
+    def __post_init__(self) -> None:
+        held = self.run_status is AgentRunStatus.AWAITING_APPROVAL
+        if held:
+            valid = self.output is None and self.error is None
+        else:
+            valid = (self.output is None) != (self.error is None)
+        if not valid:
+            raise ValueError(
+                "A tool call outcome has exactly one of output and error, "
+                "or neither if and only if the call is held for approval."
+            )
 
 
 def tool_error(error: Exception, tool_name: str) -> ToolError:
@@ -574,7 +609,8 @@ class AgentExecutor:
     # --- decision ---------------------------------------------------------------
 
     def decide(self, run_id: int, planner: DecisionPlanner) -> AgentRunStatus:
-        """Let ``planner`` choose the run's tool calls, then end the run.
+        """Let ``planner`` choose the run's tool calls, then end or pause the
+        run.
 
         What the model will be told is built from the persisted goal's
         semantic values and persisted, and the run moves to EXECUTING, before
@@ -589,7 +625,10 @@ class AgentExecutor:
         checks decide, never the proposal. A limit ends the run FAILED
         (step_limit), a PlannerError FAILED (planner_error), and any other
         planner exception FAILED (unexpected_error). A tool failure the
-        model is not shown has already ended the run by then.
+        model is not shown, or a mutation policy denies, has already ended
+        the run by then. A mutation policy holds for approval has paused it
+        (AWAITING_APPROVAL): the loop stops there, no proposal is recorded,
+        and the model is asked nothing more.
 
         Raises RunNotExecutable, calling nothing, unless the run is RESOLVED.
         """
@@ -620,7 +659,8 @@ class AgentExecutor:
                 OutcomeReason.STEP_LIMIT,
                 {"limit": error.limit.value, "maximum": error.maximum},
             )
-        except RunEndedDuringDecision:
+        except (RunEndedDuringDecision, RunAwaitingApproval):
+            # A tool call ended or paused the run; that status stands.
             with self._sessions() as log:
                 return self._get_run(log, run_id).status
         except PlannerError as error:
@@ -730,10 +770,13 @@ class AgentExecutor:
 
         A call naming anything outside the run's persisted goal is recorded
         as FAILED (goal_scope_violation) and fails the run; no business
-        transaction is opened. Raises RunNotExecutable, recording nothing,
-        unless the run is RESOLVED or EXECUTING with no unfinished call. A
-        model-directed run is refused too: its calls go through
-        call_decision_tool, which counts them.
+        transaction is opened. A mutation within the goal is then checked
+        against policy: denied, it is recorded FAILED (policy_denied) and the
+        run ends BLOCKED; held for approval, it is recorded AWAITING_APPROVAL
+        and the run pauses. Neither opens a business transaction. Raises
+        RunNotExecutable, recording nothing, unless the run is RESOLVED or
+        EXECUTING with no unfinished call. A model-directed run is refused
+        too: its calls go through call_decision_tool, which counts them.
         """
         return self._call_tool(run_id, args, decision=False)
 
@@ -741,9 +784,10 @@ class AgentExecutor:
         """Record and run one tool call a decision model chose. As call_tool,
         with three differences:
 
-        - The call is first counted against the run's read or mutation
-          limit. Over it, the call is recorded FAILED (step_limit), no
-          business transaction opens, and DecisionLimitExceeded is raised.
+        - The call is counted against the run's read or mutation limit,
+          before policy. Over it, the call is recorded FAILED (step_limit),
+          no business transaction opens, and DecisionLimitExceeded is
+          raised.
         - Its outcome's model-visible observation (observations.observe) is
           serialized and persisted with the call, in the same transaction as
           its outcome, and returned as ToolCallOutcome.observation.
@@ -762,7 +806,9 @@ class AgentExecutor:
     ) -> ToolCallOutcome:
         started = self._start_call(run_id, args, decision=decision)
         if isinstance(started, ToolCallOutcome):
-            return started  # refused for its scope; the run has ended
+            # Refused for its scope or denied by policy (the run has ended),
+            # or held for approval (the run is paused). Never run.
+            return started
         call_id, actor = started
 
         # BUSINESS: the service call and its audit event commit or roll back
@@ -815,8 +861,16 @@ class AgentExecutor:
     def _start_call(
         self, run_id: int, args: ToolInput, *, decision: bool
     ) -> ToolCallOutcome | tuple[int, str]:
-        """LOG: check the call, then record it as STARTED and return its id
-        and audit actor; or record why it was refused."""
+        """LOG: admit the call, record it as STARTED and return its id and
+        audit actor; or record why it was refused, denied or held, and
+        return (or raise) that instead.
+
+        Checked in this order, in this one transaction: the run's status and
+        unfinished calls, the goal scope, a decision run's limits, and last,
+        for a mutation that passed them, policy. So a call refused for its
+        scope or a limit is never evaluated, and its policy_decision stays
+        NULL.
+        """
         with self._sessions.begin() as log:
             run = self._get_run(log, run_id)
             if decision:
@@ -864,11 +918,25 @@ class AgentExecutor:
 
             refused = _decision_limit(calls, run.id, args) if decision else None
             if refused is None:
-                call.status = ToolCallStatus.STARTED
-                calls.add(call)
+                # A first call moves a Day 1 run to EXECUTING, whatever policy
+                # then decides.
                 if run.status is AgentRunStatus.RESOLVED:
                     transition(run, AgentRunStatus.EXECUTING)
-                return call.id, agent_run_actor(run.id)
+                # Read from committed state, here: atomic with the recorded
+                # decision, not with the business transaction that follows.
+                policy_decision = policy.evaluate(args, LicenceService(log))
+                call.policy_decision = policy_decision
+                match policy_decision:
+                    case None | PolicyDecision.ALLOW:
+                        call.status = ToolCallStatus.STARTED
+                        calls.add(call)
+                        return call.id, agent_run_actor(run.id)
+                    case PolicyDecision.DENY:
+                        return _deny(run, calls, call)
+                    case PolicyDecision.REQUIRE_APPROVAL:
+                        return _hold_for_approval(run, calls, call)
+                    case _:
+                        assert_never(policy_decision)
 
             # Over the limit: recorded, so the trace shows the attempt, and
             # never run. decide ends the run when the raise below reaches it.
@@ -989,6 +1057,50 @@ def _decision_limit(
     if calls.count_for_tools(run_id, names) >= maximum:
         return DecisionLimitExceeded(limit, maximum)
     return None
+
+
+def _deny(run: AgentRun, calls: ToolCallRepository, call: ToolCall) -> ToolCallOutcome:
+    """Record a call policy denied as FAILED, never run, and end the run
+    BLOCKED (policy_denied)."""
+    error = ToolError(
+        code=POLICY_DENIED,
+        message=f"Policy denies {call.tool_name} for this run's target.",
+        error_type=None,
+    )
+    call.status = ToolCallStatus.FAILED
+    call.error = error.model_dump(mode="json")
+    call.completed_at = utcnow()
+    calls.add(call)
+    transition(
+        run,
+        AgentRunStatus.BLOCKED,
+        reason=OutcomeReason.POLICY_DENIED,
+        detail=_call_detail(call, error),
+    )
+    return ToolCallOutcome(
+        tool_call_id=call.id,
+        sequence_no=call.sequence_no,
+        output=None,
+        error=error,
+        run_status=run.status,
+    )
+
+
+def _hold_for_approval(
+    run: AgentRun, calls: ToolCallRepository, call: ToolCall
+) -> ToolCallOutcome:
+    """Record a call policy holds for approval as AWAITING_APPROVAL, unrun,
+    with its arguments, and pause the run."""
+    call.status = ToolCallStatus.AWAITING_APPROVAL
+    calls.add(call)
+    transition(run, AgentRunStatus.AWAITING_APPROVAL)
+    return ToolCallOutcome(
+        tool_call_id=call.id,
+        sequence_no=call.sequence_no,
+        output=None,
+        error=None,
+        run_status=run.status,
+    )
 
 
 def _blocking_rejection(attempt: ToolCall | None) -> OutcomeReason | None:

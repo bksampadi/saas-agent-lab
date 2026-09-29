@@ -35,6 +35,7 @@ from app.models import (
     GoalType,
     Licence,
     OutcomeReason,
+    PolicyDecision,
     User,
 )
 from app.repositories.assignments import AssignmentRepository
@@ -157,6 +158,34 @@ def test_blocked_run_takes_no_conflicting_locks(
 
     assert get_run(sessions, run_id).status is AgentRunStatus.BLOCKED
     assert rows(sessions, Assignment) == 0
+
+
+@pytest.mark.parametrize(
+    ("agent_policy", "status"),
+    [
+        (PolicyDecision.DENY, AgentRunStatus.BLOCKED),
+        (PolicyDecision.REQUIRE_APPROVAL, AgentRunStatus.AWAITING_APPROVAL),
+    ],
+    ids=["denied", "held"],
+)
+def test_policy_stopped_run_takes_no_conflicting_locks_and_the_next_run_works(
+    executor: AgentExecutor,
+    sessions: Sessions,
+    ada: int,
+    agent_policy: PolicyDecision,
+    status: AgentRunStatus,
+) -> None:
+    # The policy read happens inside the log transaction that records the
+    # call; nothing is left open for the next run's business write to meet.
+    add(sessions, Licence(product="Zoom", seats_total=5, agent_policy=agent_policy))
+    add(sessions, Licence(product="Figma", seats_total=5))
+
+    stopped = run(executor, product="Zoom")
+    completed = run(executor)
+
+    assert get_run(sessions, stopped).status is status
+    assert get_run(sessions, completed).status is AgentRunStatus.COMPLETED
+    assert (rows(sessions, Assignment), rows(sessions, AuditEvent)) == (1, 1)
 
 
 def test_rolled_back_run_takes_no_conflicting_locks_and_the_next_run_works(
@@ -289,6 +318,23 @@ def blocked(e: AgentExecutor, s: Sessions, m: pytest.MonkeyPatch) -> None:
     run(e, product="Zoom")
 
 
+def policy_denies(e: AgentExecutor, s: Sessions, m: pytest.MonkeyPatch) -> None:
+    add(s, Licence(product="Figma", seats_total=5, agent_policy=PolicyDecision.DENY))
+    run(e)
+
+
+def policy_holds(e: AgentExecutor, s: Sessions, m: pytest.MonkeyPatch) -> None:
+    add(
+        s,
+        Licence(
+            product="Figma",
+            seats_total=5,
+            agent_policy=PolicyDecision.REQUIRE_APPROVAL,
+        ),
+    )
+    run(e)
+
+
 def needs_clarification(e: AgentExecutor, s: Sessions, m: pytest.MonkeyPatch) -> None:
     run(e, product="Sketch")
 
@@ -384,6 +430,8 @@ SCENARIOS = {
     "completes": completes,
     "already-satisfied": already_satisfied,
     "blocked": blocked,
+    "policy-denies": policy_denies,
+    "policy-holds": policy_holds,
     "needs-clarification": needs_clarification,
     "resolver-crashes": resolver_crashes,
     "verifier-crashes": verifier_crashes,

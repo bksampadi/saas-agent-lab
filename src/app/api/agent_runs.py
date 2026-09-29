@@ -43,10 +43,12 @@ def create_agent_run(
     decision_planner: DecisionPlannerDep,
     actor: ActorDep,
 ) -> AgentRunRead:
-    """Run the instruction to a terminal status, synchronously.
+    """Run the instruction to a terminal status, or to an approval pause,
+    synchronously.
 
     201 whenever a run was created: how it ended (completed, blocked, needs
-    clarification, failed) is in the body, not the status code.
+    clarification, failed), or that it awaits approval, is in the body, not
+    the status code.
     """
     try:
         record = runs.start(
