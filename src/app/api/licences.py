@@ -19,7 +19,10 @@ def create_licence(
 ) -> LicenceRead:
     try:
         licence = service.create_licence(
-            product=body.product, seats_total=body.seats_total, actor=actor
+            product=body.product,
+            seats_total=body.seats_total,
+            actor=actor,
+            agent_policy=body.agent_policy,
         )
     except ProductAlreadyExists as error:
         raise HTTPException(status.HTTP_409_CONFLICT, detail=str(error)) from error

@@ -17,13 +17,17 @@ ACTOR_HEADERS = {"X-Actor": "admin@example.com"}
 
 
 def post_licence(
-    client: TestClient, product: str = "Figma", seats_total: int = 5
+    client: TestClient,
+    product: str = "Figma",
+    seats_total: int = 5,
+    *,
+    agent_policy: str | None = None,
 ) -> httpx2.Response:
-    return client.post(
-        "/licences",
-        json={"product": product, "seats_total": seats_total},
-        headers=ACTOR_HEADERS,
-    )
+    """POST a licence; ``agent_policy`` is left out of the body unless given."""
+    body: dict[str, Any] = {"product": product, "seats_total": seats_total}
+    if agent_policy is not None:
+        body["agent_policy"] = agent_policy
+    return client.post("/licences", json=body, headers=ACTOR_HEADERS)
 
 
 def count(session: Session, model: type[Licence] | type[AuditEvent]) -> int:
@@ -38,10 +42,29 @@ def test_create_licence_returns_201_with_trimmed_product(client: TestClient) -> 
 
     assert response.status_code == 201
     body = response.json()
-    assert set(body) == {"id", "product", "seats_total"}
+    assert set(body) == {"id", "product", "seats_total", "agent_policy"}
     assert isinstance(body["id"], int)
     assert body["product"] == "Figma"
     assert body["seats_total"] == 5
+    assert body["agent_policy"] == "allow"  # the default when none is given
+
+
+@pytest.mark.parametrize("agent_policy", ["allow", "require_approval", "deny"])
+def test_create_licence_stores_and_returns_the_agent_policy(
+    client: TestClient, session: Session, agent_policy: str
+) -> None:
+    response = post_licence(client, agent_policy=agent_policy)
+
+    assert response.status_code == 201
+    created = response.json()
+    assert created["agent_policy"] == agent_policy
+    assert client.get(f"/licences/{created['id']}").json() == created
+    event = session.scalars(select(AuditEvent)).one()
+    assert event.after == {
+        "product": "Figma",
+        "seats_total": 5,
+        "agent_policy": agent_policy,
+    }
 
 
 def test_create_licence_accepts_zero_seats(client: TestClient) -> None:
@@ -62,7 +85,11 @@ def test_create_licence_records_audit_event(
     assert events[0].action == "licence.create"
     assert events[0].entity_type == "licence"
     assert events[0].entity_id == licence_id
-    assert events[0].after == {"product": "Figma", "seats_total": 5}
+    assert events[0].after == {
+        "product": "Figma",
+        "seats_total": 5,
+        "agent_policy": "allow",
+    }
 
 
 def test_create_licence_is_committed_by_the_request_transaction(
@@ -200,6 +227,11 @@ def test_create_licence_without_valid_actor_returns_422(
         {"product": "Figma", "seats_total": 1.5},
         {"product": "Figma", "seats_total": "many"},
         {"product": "Figma", "seats_total": None},
+        {"product": "Figma", "seats_total": 5, "agent_policy": "sometimes"},
+        {"product": "Figma", "seats_total": 5, "agent_policy": "ALLOW"},
+        {"product": "Figma", "seats_total": 5, "agent_policy": ""},
+        {"product": "Figma", "seats_total": 5, "agent_policy": None},
+        {"product": "Figma", "seats_total": 5, "agent_policy": 1},
     ],
 )
 def test_create_licence_with_invalid_body_returns_422(

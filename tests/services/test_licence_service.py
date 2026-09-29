@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models import AuditEvent, Licence
+from app.models import AuditEvent, Licence, PolicyDecision
 from app.repositories.audit_events import AuditEventRepository
 from app.repositories.licences import LicenceRepository
 from app.services.errors import InvalidInput, LicenceNotFound, ProductAlreadyExists
@@ -62,6 +62,28 @@ def test_create_licence_accepts_seat_bounds(
     assert licence.seats_total == seats_total
 
 
+def test_create_licence_defaults_agent_policy_to_allow(
+    service: LicenceService,
+) -> None:
+    licence = service.create_licence(product="Figma", seats_total=5, actor=ACTOR)
+
+    assert licence.agent_policy is PolicyDecision.ALLOW
+
+
+@pytest.mark.parametrize("agent_policy", list(PolicyDecision))
+def test_create_licence_stores_agent_policy(
+    service: LicenceService, session: Session, agent_policy: PolicyDecision
+) -> None:
+    licence = service.create_licence(
+        product="Figma", seats_total=5, actor=ACTOR, agent_policy=agent_policy
+    )
+    session.expire_all()
+
+    stored = session.get(Licence, licence.id)
+    assert stored is not None
+    assert stored.agent_policy is agent_policy
+
+
 # --- audit event --------------------------------------------------------------
 
 
@@ -79,7 +101,27 @@ def test_create_licence_writes_exactly_the_expected_audit_event(
     assert event.entity_type == "licence"
     assert event.entity_id == licence.id
     assert event.before is None
-    assert event.after == {"product": "Figma", "seats_total": 5}
+    assert event.after == {
+        "product": "Figma",
+        "seats_total": 5,
+        "agent_policy": "allow",
+    }
+
+
+def test_create_licence_audit_event_records_the_agent_policy(
+    service: LicenceService, session: Session
+) -> None:
+    service.create_licence(
+        product="Figma",
+        seats_total=5,
+        actor=ACTOR,
+        agent_policy=PolicyDecision.REQUIRE_APPROVAL,
+    )
+    session.expire_all()
+
+    (event,) = all_audit_events(session)
+    assert event.after is not None
+    assert event.after["agent_policy"] == "require_approval"
 
 
 # --- transactions: the caller owns them ---------------------------------------
@@ -233,6 +275,24 @@ def test_create_licence_rejects_out_of_range_seats(
 ) -> None:
     with pytest.raises(InvalidInput):
         service.create_licence(product="Figma", seats_total=seats_total, actor=ACTOR)
+
+    assert all_licences(session) == []
+    assert all_audit_events(session) == []
+
+
+@pytest.mark.parametrize("agent_policy", ["sometimes", "ALLOW", ""])
+def test_create_licence_rejects_unknown_agent_policy(
+    service: LicenceService, session: Session, agent_policy: str
+) -> None:
+    # A caller without the HTTP schema in front of it can pass any string;
+    # the member name ("ALLOW") is not a value either.
+    with pytest.raises(InvalidInput, match="Agent policy must be one of"):
+        service.create_licence(
+            product="Figma",
+            seats_total=5,
+            actor=ACTOR,
+            agent_policy=agent_policy,  # type: ignore[arg-type]
+        )
 
     assert all_licences(session) == []
     assert all_audit_events(session) == []

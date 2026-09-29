@@ -8,7 +8,7 @@ from typing import Any
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models import AuditEvent, Licence
+from app.models import AuditEvent, Licence, PolicyDecision
 from app.repositories.audit_events import AuditEventRepository
 from app.repositories.licences import LicenceRepository, is_duplicate_product
 from app.services.errors import InvalidInput, LicenceNotFound, ProductAlreadyExists
@@ -29,9 +29,24 @@ def _validated_seats_total(seats_total: int) -> int:
     return seats_total
 
 
+def _validated_agent_policy(agent_policy: PolicyDecision) -> PolicyDecision:
+    # The type says PolicyDecision, but a caller without the HTTP schema in
+    # front of it can pass any string.
+    try:
+        return PolicyDecision(agent_policy)
+    except ValueError:
+        raise InvalidInput(
+            f"Agent policy must be one of: {', '.join(PolicyDecision)}."
+        ) from None
+
+
 def _audit_snapshot(licence: Licence) -> dict[str, Any]:
     # Business fields only: the id has its own column.
-    return {"product": licence.product, "seats_total": licence.seats_total}
+    return {
+        "product": licence.product,
+        "seats_total": licence.seats_total,
+        "agent_policy": licence.agent_policy.value,
+    }
 
 
 class LicenceService:
@@ -39,12 +54,20 @@ class LicenceService:
         self._licences = LicenceRepository(session)
         self._audit_events = AuditEventRepository(session)
 
-    def create_licence(self, *, product: str, seats_total: int, actor: str) -> Licence:
+    def create_licence(
+        self,
+        *,
+        product: str,
+        seats_total: int,
+        actor: str,
+        agent_policy: PolicyDecision = PolicyDecision.ALLOW,
+    ) -> Licence:
         """Create a licence and its audit event in the caller's transaction."""
         # Trimmed but case kept: product names are display names, and the
         # unique constraint in the database is case-sensitive.
         product = required_text(product, field="Product", max_length=PRODUCT_MAX_LENGTH)
         seats_total = _validated_seats_total(seats_total)
+        agent_policy = _validated_agent_policy(agent_policy)
         actor = validated_actor(actor)
 
         if self._licences.get_by_product(product) is not None:
@@ -52,7 +75,11 @@ class LicenceService:
 
         try:
             licence = self._licences.add(
-                Licence(product=product, seats_total=seats_total)
+                Licence(
+                    product=product,
+                    seats_total=seats_total,
+                    agent_policy=agent_policy,
+                )
             )
         except IntegrityError as error:
             # Another request may have created the same product between our

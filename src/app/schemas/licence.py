@@ -2,6 +2,7 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
+from app.models import PolicyDecision
 from app.services.licences import PRODUCT_MAX_LENGTH, SEATS_TOTAL_MAX
 
 
@@ -15,6 +16,7 @@ class LicenceCreate(BaseModel):
         ),
     ]
     seats_total: Annotated[int, Field(ge=0, le=SEATS_TOTAL_MAX)]
+    agent_policy: PolicyDecision = PolicyDecision.ALLOW
 
 
 class LicenceRead(BaseModel):
@@ -23,3 +25,4 @@ class LicenceRead(BaseModel):
     id: int
     product: str
     seats_total: int
+    agent_policy: PolicyDecision

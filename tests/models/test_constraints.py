@@ -7,7 +7,14 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, StatementError
 from sqlalchemy.orm import Session
 
-from app.models import Assignment, AuditEvent, Licence, User, UserStatus
+from app.models import (
+    Assignment,
+    AuditEvent,
+    Licence,
+    PolicyDecision,
+    User,
+    UserStatus,
+)
 
 
 def make_user(session: Session, email: str = "ada@example.com") -> User:
@@ -88,6 +95,48 @@ def test_licence_product_is_unique(session: Session) -> None:
 def test_licence_seats_total_cannot_be_negative(session: Session) -> None:
     with pytest.raises(IntegrityError):
         make_licence(session, seats=-1)
+
+
+def test_licence_agent_policy_defaults_to_allow_and_stores_enum_value(
+    session: Session,
+) -> None:
+    licence = make_licence(session)
+
+    stored = session.execute(
+        text("SELECT agent_policy FROM licences WHERE id = :id"), {"id": licence.id}
+    ).scalar_one()
+
+    assert licence.agent_policy is PolicyDecision.ALLOW
+    assert stored == "allow"
+
+
+def test_licence_agent_policy_defaults_to_allow_in_the_database(
+    session: Session,
+) -> None:
+    # A row written without the column, as the migration's existing rows are.
+    session.execute(
+        text("INSERT INTO licences (product, seats_total) VALUES ('Slack', 1)")
+    )
+
+    stored = session.execute(
+        text("SELECT agent_policy FROM licences WHERE product = 'Slack'")
+    ).scalar_one()
+
+    assert stored == "allow"
+
+
+@pytest.mark.parametrize("policy", ["sometimes", "ALLOW", None])
+def test_licence_agent_policy_rejects_unknown_or_missing_value(
+    session: Session, policy: str | None
+) -> None:
+    with pytest.raises(IntegrityError):
+        session.execute(
+            text(
+                "INSERT INTO licences (product, seats_total, agent_policy) "
+                "VALUES ('Slack', 1, :policy)"
+            ),
+            {"policy": policy},
+        )
 
 
 # --- Assignment -------------------------------------------------------------
