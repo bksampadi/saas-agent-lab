@@ -15,6 +15,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from pydantic_ai.messages import ModelResponse
 from sqlalchemy import Engine, event, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
@@ -23,7 +24,7 @@ from sqlalchemy.pool import QueuePool
 import app.agent.executor as executor_module
 from app.agent import tools
 from app.agent.executor import AgentExecutor
-from app.agent.harness import run_ensure_assignment
+from app.agent.planner import DecisionModelCallRecorder, TargetTools
 from app.core.database import create_db_engine
 from app.models import (
     AgentRun,
@@ -43,14 +44,25 @@ from app.repositories.tool_calls import ToolCallRepository
 from app.schemas.agent import (
     AssignLicenceInput,
     AssignmentSnapshot,
-    ExtractedAssignmentIntent,
-    GetLicenceInput,
-    ListUserAssignmentsInput,
+    DecisionContext,
+    DecisionProposal,
+    GoalReached,
 )
 from app.services.assignments import AssignmentService
 from app.services.users import UserService
+from support import (
+    ASSIGN,
+    ASSIGNMENTS,
+    CAPACITY,
+    GOAL_REACHED,
+    HUMAN,
+    FakeDecisionPlanner,
+    Script,
+    call,
+    directed_run,
+    resolved_run,
+)
 
-HUMAN = "admin@example.com"
 Sessions = sessionmaker[Session]
 
 
@@ -87,11 +99,12 @@ def add(sessions: Sessions, row: User | Licence | Assignment) -> int:
 
 
 def run(executor: AgentExecutor, product: str = "Figma") -> int:
-    return run_ensure_assignment(
+    """A whole run whose model reads, then tries to assign, then claims
+    success."""
+    return directed_run(
         executor,
-        instruction="Give Ada a seat.",
-        requesting_actor=HUMAN,
-        intent=ExtractedAssignmentIntent(user_email="ada@example.com", product=product),
+        Script(call(ASSIGNMENTS), call(CAPACITY), call(ASSIGN), GOAL_REACHED),
+        product=product,
     )
 
 
@@ -214,50 +227,6 @@ def test_rolled_back_run_takes_no_conflicting_locks_and_the_next_run_works(
     assert (rows(sessions, Assignment), rows(sessions, AuditEvent)) == (1, 1)
 
 
-def test_goal_scope_violation_takes_no_conflicting_locks(
-    executor: AgentExecutor, sessions: Sessions, ada: int
-) -> None:
-    figma = add(sessions, Licence(product="Figma", seats_total=5))
-    bob = add(sessions, User(email="bob@example.com", name="Bob"))
-    run_id = executor.create_run(
-        instruction="Give Ada a seat.",
-        requesting_actor=HUMAN,
-        intent=ExtractedAssignmentIntent(user_email="ada@example.com", product="Figma"),
-    )
-    executor.resolve_run(run_id)
-
-    outcome = executor.call_tool(
-        run_id, AssignLicenceInput(user_id=bob, licence_id=figma)
-    )
-
-    assert outcome.run_status is AgentRunStatus.FAILED
-    assert rows(sessions, Assignment) == 0
-
-
-def test_stale_capacity_run_takes_no_conflicting_locks(
-    executor: AgentExecutor, sessions: Sessions, ada: int
-) -> None:
-    zoom = add(sessions, Licence(product="Zoom", seats_total=1))
-    bob = add(sessions, User(email="bob@example.com", name="Bob"))
-    run_id = executor.create_run(
-        instruction="Give Ada a seat.",
-        requesting_actor=HUMAN,
-        intent=ExtractedAssignmentIntent(user_email="ada@example.com", product="Zoom"),
-    )
-    executor.resolve_run(run_id)
-    executor.call_tool(run_id, GetLicenceInput(licence_id=zoom))
-    with sessions.begin() as session:
-        AssignmentService(session).assign_licence(
-            user_id=bob, licence_id=zoom, actor=HUMAN
-        )
-
-    outcome = executor.call_tool(
-        run_id, AssignLicenceInput(user_id=ada, licence_id=zoom)
-    )
-
-    assert outcome.run_status is AgentRunStatus.BLOCKED
-
-
 # --- never two transactions at once, on every path ----------------------------
 
 
@@ -290,16 +259,6 @@ def transactions(locking_engine: Engine) -> Iterator[TransactionCounter]:
     event.remove(locking_engine, "begin", began)
     event.remove(locking_engine, "commit", ended)
     event.remove(locking_engine, "rollback", ended)
-
-
-def resolved(executor: AgentExecutor, product: str = "Figma") -> int:
-    run_id = executor.create_run(
-        instruction="Give Ada a seat.",
-        requesting_actor=HUMAN,
-        intent=ExtractedAssignmentIntent(user_email="ada@example.com", product=product),
-    )
-    executor.resolve_run(run_id)
-    return run_id
 
 
 def completes(e: AgentExecutor, s: Sessions, m: pytest.MonkeyPatch) -> None:
@@ -380,12 +339,6 @@ def verification_fails(e: AgentExecutor, s: Sessions, m: pytest.MonkeyPatch) -> 
     run(e)
 
 
-def scope_violation(e: AgentExecutor, s: Sessions, m: pytest.MonkeyPatch) -> None:
-    figma = add(s, Licence(product="Figma", seats_total=5))
-    bob = add(s, User(email="bob@example.com", name="Bob"))
-    e.call_tool(resolved(e), AssignLicenceInput(user_id=bob, licence_id=figma))
-
-
 def assignment_rolls_back(e: AgentExecutor, s: Sessions, m: pytest.MonkeyPatch) -> None:
     add(s, Licence(product="Figma", seats_total=5))
     real_add = AssignmentRepository.add
@@ -400,30 +353,41 @@ def assignment_rolls_back(e: AgentExecutor, s: Sessions, m: pytest.MonkeyPatch) 
 
 def assigned_elsewhere(e: AgentExecutor, s: Sessions, m: pytest.MonkeyPatch) -> None:
     figma = add(s, Licence(product="Figma", seats_total=5))
-    run_id = resolved(e)
-    goal = e.get_goal(run_id)
-    e.call_tool(run_id, ListUserAssignmentsInput(user_id=goal.user_id))
-    with s.begin() as session:
-        AssignmentService(session).assign_licence(
-            user_id=goal.user_id, licence_id=figma, actor=HUMAN
-        )
-    e.call_tool(run_id, AssignLicenceInput(user_id=goal.user_id, licence_id=figma))
-    e.verify_and_finish(run_id)
+
+    def assigned_by_a_person_then_assign() -> ModelResponse:
+        # Between the model's requests: no transaction of the run is open.
+        with s.begin() as session:
+            ada = session.scalars(
+                select(User.id).where(User.email == "ada@example.com")
+            ).one()
+            AssignmentService(session).assign_licence(
+                user_id=ada, licence_id=figma, actor=HUMAN
+            )
+        return call(ASSIGN)
+
+    directed_run(
+        e, Script(call(ASSIGNMENTS), assigned_by_a_person_then_assign, GOAL_REACHED)
+    )
 
 
 def crash_after_business_commit(
     e: AgentExecutor, s: Sessions, m: pytest.MonkeyPatch
 ) -> None:
-    figma = add(s, Licence(product="Figma", seats_total=5))
-    run_id = resolved(e)
-    goal = e.get_goal(run_id)
+    add(s, Licence(product="Figma", seats_total=5))
+    run_id = resolved_run(e)
 
     def crash(*_: Any) -> None:
         raise Crash
 
+    def assign(
+        context: DecisionContext, target: TargetTools, calls: DecisionModelCallRecorder
+    ) -> DecisionProposal:
+        target.assign_target_licence()
+        return GoalReached()
+
     m.setattr(ToolCallRepository, "get", crash)
     with pytest.raises(Crash):
-        e.call_tool(run_id, AssignLicenceInput(user_id=goal.user_id, licence_id=figma))
+        e.decide(run_id, FakeDecisionPlanner(assign))
 
 
 SCENARIOS = {
@@ -436,7 +400,6 @@ SCENARIOS = {
     "resolver-crashes": resolver_crashes,
     "verifier-crashes": verifier_crashes,
     "verification-fails": verification_fails,
-    "scope-violation": scope_violation,
     "assignment-rolls-back": assignment_rolls_back,
     "assigned-elsewhere": assigned_elsewhere,
     "crash-after-business-commit": crash_after_business_commit,

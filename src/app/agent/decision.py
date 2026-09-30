@@ -57,7 +57,7 @@ class DecisionLimitExceeded(DecisionStopped):
 
 class RunEndedDuringDecision(DecisionStopped):
     """A tool call ended the run in a way the model is not shown: a failure
-    (as it ends a deterministic run), or a mutation policy denied."""
+    it is not shown, or a mutation policy denied."""
 
     def __init__(self, run_id: int, status: AgentRunStatus) -> None:
         super().__init__(f"Agent run {run_id} ended {status} during a tool call.")

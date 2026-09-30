@@ -8,12 +8,11 @@ Extraction happens within RECEIVED and adds no status: it either fills in
 the run's goal columns, leaving it RECEIVED and ready for resolution, or
 ends the run (NEEDS_CLARIFICATION or FAILED, with an extraction reason).
 
-BLOCKED is reached from EXECUTING when a deterministic tool call is
-rejected by a blocking domain rule or policy denies a mutation, and from
-VERIFYING when a model-directed run's goal is unsatisfied and a blocking
-condition is established by the application (a rejected assignment, or a
-claimed condition confirmed against current state). The model's proposal
-alone never reaches it.
+BLOCKED is reached from EXECUTING when policy denies a mutation, and from
+VERIFYING when the goal is unsatisfied and a blocking condition is
+established by the application (a rejected assignment, or a claimed
+condition confirmed against current state). The model's proposal alone
+never reaches it.
 
 AWAITING_APPROVAL is reached from EXECUTING when policy requires a person's
 approval for a mutation, before it runs. It is not terminal, and nothing

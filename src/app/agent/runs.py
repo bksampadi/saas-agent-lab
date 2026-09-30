@@ -1,7 +1,7 @@
 """Natural-language agent runs, as callers outside the agent layer use them:
 start one and read one back.
 
-Nothing here decides anything. ``start`` is run_directed_instruction, so the
+Nothing here decides anything. ``start`` is AgentExecutor.run, so the
 executor opens and closes its own short transactions, and no session is
 open while a model runs. That is why this takes a session factory rather
 than a session: a caller's transaction must never wrap a run. ``get`` reads
@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.agent.executor import AgentExecutor, AgentRunNotFound
-from app.agent.harness import run_directed_instruction
 from app.agent.planner import DecisionPlanner, IntentPlanner
 from app.models import AgentRun, ModelCall, ToolCall
 from app.repositories.agent_runs import AgentRunRepository
@@ -49,12 +48,11 @@ class AgentRuns:
         limit, failed verification...) is its persisted outcome, not an
         exception.
         """
-        run_id = run_directed_instruction(
-            AgentExecutor(self._sessions),
-            intent_planner,
-            decision_planner,
+        run_id = AgentExecutor(self._sessions).run(
             instruction=instruction,
             requesting_actor=requesting_actor,
+            intent_planner=intent_planner,
+            decision_planner=decision_planner,
         )
         return self.get(run_id)
 

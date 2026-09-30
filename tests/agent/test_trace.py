@@ -8,6 +8,7 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.agent.executor import AgentExecutor, RunNotExecutable
+from app.agent.pydantic_ai_planner import PydanticAIIntentPlanner
 from app.models import (
     AgentRun,
     AgentRunStatus,
@@ -20,12 +21,8 @@ from app.models import (
 )
 from app.repositories.agent_runs import AgentRunRepository
 from app.repositories.model_calls import ModelCallRepository
-from app.schemas.agent import (
-    ExtractedAssignmentIntent,
-    GetLicenceInput,
-    GetUserInput,
-)
 from app.services.errors import InvalidInput
+from support import ASSIGN, ASSIGNMENTS, GOAL_REACHED, Script, call, conclude
 
 HUMAN = "admin@example.com"
 INSTRUCTION = "Give ada@example.com a Figma seat."
@@ -109,9 +106,22 @@ def test_receive_run_persists_a_run_with_no_goal_before_any_model_call(
 
 @pytest.mark.parametrize(
     ("instruction", "actor"),
-    [("", HUMAN), ("x" * 2001, HUMAN), (INSTRUCTION, "agent:run-1"), (INSTRUCTION, "")],
+    [
+        *[(instruction, HUMAN) for instruction in ("", "   ", "x" * 2001)],
+        *[
+            (INSTRUCTION, actor)
+            for actor in (
+                "",
+                "   ",
+                "a" * 321,
+                "agent:run-1",
+                " Agent:run-1",
+                "AGENT:x",
+            )
+        ],
+    ],
 )
-def test_receive_run_validates_like_create_run(
+def test_receive_run_rejects_invalid_input_and_records_nothing(
     executor: AgentExecutor, session_factory: Sessions, instruction: str, actor: str
 ) -> None:
     with pytest.raises(InvalidInput):
@@ -148,22 +158,21 @@ def test_the_counter_hands_out_increasing_numbers_and_persists_them(
     assert get_run(session_factory, run_id).last_sequence_no == 3
 
 
-def test_interleaved_model_and_tool_calls_share_one_order_that_ignores_timestamps(
+def test_a_whole_run_has_one_order_that_ignores_timestamps(
     executor: AgentExecutor, session_factory: Sessions, seed: tuple[int, int]
 ) -> None:
-    # The shape a model-directed run will have: a model call, then the tool
-    # call it led to, and so on.
-    user_id, licence_id = seed
-    run_id = executor.create_run(
+    # Extraction's model call, then each decision request and the tool call
+    # it led to, all on the run's one counter.
+    extraction = Script(
+        conclude("ensure_assignment", user_email="ada@example.com", product="Figma")
+    )
+    decision = Script(call(ASSIGNMENTS), call(ASSIGN), GOAL_REACHED)
+    run_id = executor.run(
         instruction=INSTRUCTION,
         requesting_actor=HUMAN,
-        intent=ExtractedAssignmentIntent(user_email="ada@example.com", product="Figma"),
+        intent_planner=PydanticAIIntentPlanner(extraction.model(), timeout_seconds=5),
+        decision_planner=decision.planner(),
     )
-    executor.resolve_run(run_id)
-    record_model_call(session_factory, run_id)
-    executor.call_tool(run_id, GetUserInput(user_id=user_id))
-    record_model_call(session_factory, run_id)
-    executor.call_tool(run_id, GetLicenceInput(licence_id=licence_id))
     tie = datetime(2026, 9, 27, 12, 0, tzinfo=UTC)
     with session_factory.begin() as session:
         for model in (ModelCall, ToolCall):
@@ -176,17 +185,19 @@ def test_interleaved_model_and_tool_calls_share_one_order_that_ignores_timestamp
     assert [
         (
             entry.sequence_no,
-            "model" if isinstance(entry, ModelCall) else entry.tool_name,
+            entry.stage.value if isinstance(entry, ModelCall) else entry.tool_name,
         )
         for entry in entries
-    ] == [(1, "model"), (2, "get_user"), (3, "model"), (4, "get_licence")]
+    ] == [
+        (1, "extraction"),
+        (2, "decision"),
+        (3, "list_user_assignments"),
+        (4, "decision"),
+        (5, "assign_licence"),
+        (6, "decision"),
+    ]
     assert {entry.created_at for entry in entries} == {tie}
-    assert get_run(session_factory, run_id).last_sequence_no == 4
-    with session_factory() as session:
-        assert [
-            call.sequence_no
-            for call in ModelCallRepository(session).list_for_run(run_id)
-        ] == [1, 3]
+    assert get_run(session_factory, run_id).last_sequence_no == 6
 
 
 def test_each_run_has_its_own_counter(

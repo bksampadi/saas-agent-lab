@@ -2,12 +2,11 @@
 
 No tool takes an argument. The model chooses the capability; the
 application chooses the target. Each call is built here from the run's
-persisted goal and goes through AgentExecutor.call_decision_tool: the same
-path as a deterministic call (goal-scope check, ToolCall trace, business
-transaction, audit actor "agent:run-<id>"), plus the decision limits and the
-observation boundary. The model gets back only the call's persisted
-observation, never the internal result. A call policy denies or holds for
-approval gives it nothing, and stops its loop.
+persisted goal and goes through AgentExecutor.call_decision_tool (goal-scope
+check, decision limits, policy, ToolCall trace, business transaction, audit
+actor "agent:run-<id>", observation boundary). The model gets back only the
+call's persisted observation, never the internal result. A call policy
+denies or holds for approval gives it nothing, and stops its loop.
 """
 
 from typing import TYPE_CHECKING

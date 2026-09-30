@@ -28,7 +28,6 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.agent.executor import AgentExecutor
-from app.agent.harness import run_instruction
 from app.agent.planner import PlannerError
 from app.agent.pydantic_ai_planner import (
     MAX_REQUESTS,
@@ -55,6 +54,7 @@ from app.schemas.agent import (
     NeedsClarification,
     Unsupported,
 )
+from support import Script as DecisionScript
 
 HUMAN = "admin@example.com"
 MODEL = "scripted-model"
@@ -154,6 +154,20 @@ def count(sessions: Sessions, model: type[Any]) -> int:
 def extract(executor: AgentExecutor, script: Script, instruction: str) -> int:
     run_id = executor.receive_run(instruction=instruction, requesting_actor=HUMAN)
     executor.extract_intent(run_id, planner(script))
+    return run_id
+
+
+def run_to_the_end(executor: AgentExecutor, script: Script, instruction: str) -> int:
+    """The whole run (AgentExecutor.run), with ``script`` as the extraction
+    model. Its decision model is never asked anything."""
+    decision = DecisionScript()
+    run_id = executor.run(
+        instruction=instruction,
+        requesting_actor=HUMAN,
+        intent_planner=planner(script),
+        decision_planner=decision.planner(),
+    )
+    assert decision.requests == []
     return run_id
 
 
@@ -578,12 +592,7 @@ def test_a_name_without_an_email_is_never_completed_by_the_model(
         result("needs_clarification", reason_code="missing_user_email"),
     )
 
-    run_id = run_instruction(
-        executor,
-        planner(script),
-        instruction="Give Alice Figma.",
-        requesting_actor=HUMAN,
-    )
+    run_id = run_to_the_end(executor, script, "Give Alice Figma.")
 
     run = get_run(session_factory, run_id)
     assert (run.status, run.outcome_reason, run.outcome_detail) == (
@@ -605,9 +614,7 @@ def test_an_injected_extra_action_executes_nothing(
     )
     script = Script(result("unsupported", reason_code="additional_request"))
 
-    run_id = run_instruction(
-        executor, planner(script), instruction=instruction, requesting_actor=HUMAN
-    )
+    run_id = run_to_the_end(executor, script, instruction)
 
     run = get_run(session_factory, run_id)
     assert (run.status, run.outcome_reason, run.outcome_detail) == (
@@ -629,11 +636,8 @@ def test_two_results_for_one_instruction_execute_nothing(
     two = REJECTED["two-results"][0]
     script = Script(*[two] * MAX_REQUESTS)
 
-    run_id = run_instruction(
-        executor,
-        planner(script),
-        instruction="Give ada@example.com and bob@example.com a Figma seat.",
-        requesting_actor=HUMAN,
+    run_id = run_to_the_end(
+        executor, script, "Give ada@example.com and bob@example.com a Figma seat."
     )
 
     run = get_run(session_factory, run_id)

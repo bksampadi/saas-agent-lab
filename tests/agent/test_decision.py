@@ -7,14 +7,12 @@ boundary would be visible in what the model was sent.
 """
 
 import json
-from collections.abc import Callable
 from typing import Any
 
 import pydantic_ai.models
 import pytest
 from pydantic_ai import ModelHTTPError
 from pydantic_ai.messages import (
-    ModelMessage,
     ModelRequest,
     ModelResponse,
     RetryPromptPart,
@@ -23,8 +21,6 @@ from pydantic_ai.messages import (
     ToolReturnPart,
     UserPromptPart,
 )
-from pydantic_ai.models.function import AgentInfo, FunctionModel
-from pydantic_ai.usage import RequestUsage
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -57,10 +53,25 @@ from app.models import (
 )
 from app.repositories.agent_runs import AgentRunRepository
 from app.repositories.tool_calls import ToolCallRepository
-from app.schemas.agent import DecisionTask, ExtractedAssignmentIntent
+from app.schemas.agent import DecisionTask
+from support import (
+    ASSIGN,
+    ASSIGNMENTS,
+    CAPACITY,
+    GOAL_REACHED,
+    MODEL,
+    NO_ACTION_NEEDED,
+    PROPOSALS,
+    USER,
+    Script,
+    Step,
+    call,
+    cannot_proceed,
+    conclude,
+    resolved_run,
+    usage,
+)
 
-HUMAN = "admin@example.com"
-MODEL = "scripted-model"
 Sessions = sessionmaker[Session]
 S = AgentRunStatus
 R = OutcomeReason
@@ -71,72 +82,6 @@ FIGMA = 97531
 HELD = 86420  # Ada's assignment, when she already holds a seat
 OTHERS = 36400  # other users, and their assignments, from here up
 DISTINCTIVE_IDS = [str(n) for n in (ADA, FIGMA, HELD, OTHERS)]
-
-Step = ModelResponse | Exception | Callable[[], ModelResponse]
-
-
-# --- scripted model -----------------------------------------------------------
-
-
-class Script:
-    """A FunctionModel that answers with ``steps`` in order, and keeps every
-    request it was sent. A step may be an exception to raise, or a callable
-    run when the request arrives (to change state between requests)."""
-
-    def __init__(self, *steps: Step) -> None:
-        self.steps = list(steps)
-        self.requests: list[list[ModelMessage]] = []
-        self.infos: list[AgentInfo] = []
-
-    def respond(self, messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        self.requests.append(list(messages))
-        self.infos.append(info)
-        step = self.steps.pop(0)
-        if isinstance(step, Exception):
-            raise step
-        if isinstance(step, ModelResponse):
-            return step
-        return step()
-
-    def planner(self) -> PydanticAIDecisionPlanner:
-        return PydanticAIDecisionPlanner(
-            FunctionModel(self.respond, model_name=MODEL), timeout_seconds=5
-        )
-
-    def sent_parts(self) -> list[Any]:
-        """Every request part the model was sent: the last request carries
-        the whole conversation."""
-        last = self.requests[-1] if self.requests else []
-        return [part for m in last if isinstance(m, ModelRequest) for part in m.parts]
-
-
-def usage() -> RequestUsage:
-    return RequestUsage(input_tokens=100, output_tokens=10)
-
-
-def call(*tool_names: str) -> ModelResponse:
-    return ModelResponse(
-        parts=[ToolCallPart(name, {}) for name in tool_names], usage=usage()
-    )
-
-
-def conclude(tool_name: str, **args: Any) -> ModelResponse:
-    return ModelResponse(parts=[ToolCallPart(tool_name, args)], usage=usage())
-
-
-GOAL_REACHED = conclude("goal_reached")
-NO_ACTION_NEEDED = conclude("no_action_needed")
-
-
-def cannot_proceed(reason: str) -> ModelResponse:
-    return conclude("cannot_proceed", reason_code=reason)
-
-
-USER = "get_target_user"
-CAPACITY = "get_target_licence_capacity"
-ASSIGNMENTS = "list_target_user_assignments"
-ASSIGN = "assign_target_licence"
-PROPOSALS = {"goal_reached", "no_action_needed", "cannot_proceed"}
 
 
 def returned_to_model(script: Script) -> list[str]:
@@ -172,16 +117,6 @@ def seed(
             session.add(User(id=other, email=f"u{n}@example.com", name=f"U{n}"))
             session.flush()
             session.add(Assignment(id=other, user_id=other, licence_id=FIGMA))
-
-
-def resolved_run(executor: AgentExecutor) -> int:
-    run_id = executor.create_run(
-        instruction="Give ada@example.com a Figma seat.",
-        requesting_actor=HUMAN,
-        intent=ExtractedAssignmentIntent(user_email="ada@example.com", product="Figma"),
-    )
-    assert executor.resolve_run(run_id) is S.RESOLVED
-    return run_id
 
 
 def decide(executor: AgentExecutor, script: Script) -> tuple[int, AgentRunStatus]:

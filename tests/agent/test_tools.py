@@ -1,7 +1,7 @@
 """Tools return structured application facts, exactly the ones they read.
 
-Called through the executor, as a planner will call them, and checked in
-the persisted ToolCall.result.
+Called by a scripted model through the executor, and checked in the
+persisted ToolCall.result.
 """
 
 from dataclasses import fields
@@ -15,16 +15,26 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.agent import tools
 from app.agent.executor import AgentExecutor
-from app.models import AgentRunStatus, Assignment, AuditEvent, Licence, ToolCall, User
+from app.models import Assignment, AuditEvent, Licence, ToolCall, User
 from app.schemas.agent import (
     AssignLicenceInput,
-    ExtractedAssignmentIntent,
     GetLicenceInput,
     GetUserInput,
     ListUserAssignmentsInput,
     ToolInput,
 )
 from app.schemas.assignment import ID_MAX
+from support import (
+    ASSIGN,
+    ASSIGNMENTS,
+    CAPACITY,
+    GOAL_REACHED,
+    NO_ACTION_NEEDED,
+    USER,
+    Script,
+    call,
+    resolved_run,
+)
 
 Sessions = sessionmaker[Session]
 BUSINESS_TABLES = ("users", "licences", "assignments", "audit_events")
@@ -37,21 +47,17 @@ def add(sessions: Sessions, row: User | Licence | Assignment) -> int:
         return row.id
 
 
-def resolved_run(executor: AgentExecutor) -> int:
-    run_id = executor.create_run(
-        instruction="Give Ada a Figma seat.",
-        requesting_actor="admin@example.com",
-        intent=ExtractedAssignmentIntent(user_email="ada@example.com", product="Figma"),
-    )
-    assert executor.resolve_run(run_id) is AgentRunStatus.RESOLVED
-    return run_id
-
-
-def persisted_result(sessions: Sessions, tool_call_id: int) -> dict[str, Any]:
+def result_of(executor: AgentExecutor, sessions: Sessions, tool: str) -> dict[str, Any]:
+    """The persisted result of one call of the model-facing ``tool``."""
+    run_id = resolved_run(executor)
+    conclusion = GOAL_REACHED if tool == ASSIGN else NO_ACTION_NEEDED
+    executor.decide(run_id, Script(call(tool), conclusion).planner())
     with sessions() as session:
-        call = session.get(ToolCall, tool_call_id)
-        assert call is not None and call.result is not None
-        return call.result
+        (tool_call,) = session.scalars(
+            select(ToolCall).where(ToolCall.agent_run_id == run_id)
+        ).all()
+    assert tool_call.result is not None
+    return tool_call.result
 
 
 def count(sessions: Sessions, model: type[Assignment] | type[AuditEvent]) -> int:
@@ -72,11 +78,9 @@ def figma(session_factory: Sessions) -> int:
 def test_get_user_returns_exactly_the_user_facts(
     executor: AgentExecutor, session_factory: Sessions, ada: int, figma: int
 ) -> None:
-    run_id = resolved_run(executor)
+    result = result_of(executor, session_factory, USER)
 
-    outcome = executor.call_tool(run_id, GetUserInput(user_id=ada))
-
-    assert persisted_result(session_factory, outcome.tool_call_id) == {
+    assert result == {
         "user_id": ada,
         "email": "ada@example.com",
         "name": "Ada Lovelace",
@@ -96,11 +100,10 @@ def test_get_licence_returns_exactly_the_capacity_facts(
         Assignment(user_id=carol, licence_id=figma, revoked_at=datetime.now(UTC)),
     )
     add(session_factory, Assignment(user_id=bob, licence_id=slack))
-    run_id = resolved_run(executor)
 
-    outcome = executor.call_tool(run_id, GetLicenceInput(licence_id=figma))
+    result = result_of(executor, session_factory, CAPACITY)
 
-    assert persisted_result(session_factory, outcome.tool_call_id) == {
+    assert result == {
         "licence_id": figma,
         "product": "Figma",
         "seats_total": 3,
@@ -121,11 +124,9 @@ def test_list_user_assignments_returns_the_users_active_and_revoked_rows(
     )
     add(session_factory, Assignment(user_id=bob, licence_id=figma))
     active = add(session_factory, Assignment(user_id=ada, licence_id=slack))
-    run_id = resolved_run(executor)
 
-    outcome = executor.call_tool(run_id, ListUserAssignmentsInput(user_id=ada))
+    result = result_of(executor, session_factory, ASSIGNMENTS)
 
-    result = persisted_result(session_factory, outcome.tool_call_id)
     assert set(result) == {"user_id", "assignments"}
     assert result["user_id"] == ada
     rows = result["assignments"]
@@ -148,13 +149,8 @@ def test_list_user_assignments_returns_the_users_active_and_revoked_rows(
 def test_assign_licence_returns_exactly_the_new_assignment_facts(
     executor: AgentExecutor, session_factory: Sessions, ada: int, figma: int
 ) -> None:
-    run_id = resolved_run(executor)
+    result = result_of(executor, session_factory, ASSIGN)
 
-    outcome = executor.call_tool(
-        run_id, AssignLicenceInput(user_id=ada, licence_id=figma)
-    )
-
-    result = persisted_result(session_factory, outcome.tool_call_id)
     assigned_at = result.pop("assigned_at")
     assert result == {
         "assignment_id": 1,
@@ -176,12 +172,9 @@ def test_read_tools_change_nothing_and_write_no_audit_events(
     run_id = resolved_run(executor)
     statements.clear()
 
-    for args in (
-        GetUserInput(user_id=ada),
-        GetLicenceInput(licence_id=figma),
-        ListUserAssignmentsInput(user_id=ada),
-    ):
-        executor.call_tool(run_id, args)
+    executor.decide(
+        run_id, Script(call(USER, CAPACITY, ASSIGNMENTS), NO_ACTION_NEEDED).planner()
+    )
 
     business = [s for s in statements if any(f" {t}" in s for t in BUSINESS_TABLES)]
     assert business

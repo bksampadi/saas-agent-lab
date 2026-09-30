@@ -35,6 +35,8 @@ select = ["E", "F", "I", "B", "UP"]
 testpaths = ["tests"]
 # Live tests are deselected unless asked for by name: `pytest -m live`.
 addopts = "-ra --strict-markers --import-mode=importlib -m 'not live'"
+# Test support shared across test packages: `from support import ...`.
+pythonpath = ["tests"]
 markers = [
     "live: sends real, billable model requests; run only with `-m live` and the provider's API key set",
 ]
@@ -43,6 +45,7 @@ markers = [
 include = ["src", "tests"]
 typeCheckingMode = "basic"
 pythonVersion = "3.12"
+extraPaths = ["tests"]
 
 [dependency-groups]
 dev = [

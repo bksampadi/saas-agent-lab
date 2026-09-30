@@ -1,19 +1,17 @@
 """Extraction through the executor, with a fake planner in place of a model:
-the run's lifecycle, persisted model calls, and the whole run's ordered
-trace. The trace substrate itself is tested in test_trace.py."""
+the run's lifecycle and its persisted model calls. The run's ordered trace
+is tested in test_trace.py."""
 
 import sqlite3
 from collections.abc import Callable, Iterator
-from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import Engine, select, update
+from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
 from app.agent.executor import AgentExecutor, RunNotExecutable
-from app.agent.harness import run_instruction
 from app.agent.planner import ModelCallRecorder, PlannerError
 from app.core.database import create_db_engine
 from app.models import (
@@ -33,7 +31,6 @@ from app.models import (
 from app.repositories.agent_runs import AgentRunRepository
 from app.schemas.agent import (
     EnsureAssignmentIntent,
-    ExtractedAssignmentIntent,
     ExtractedIntent,
     ModelCallError,
     ModelCallRecord,
@@ -172,12 +169,10 @@ def test_an_assignment_intent_becomes_the_goal_exactly_as_extracted(
         "figma",
     )
     assert run.resolved_user_id is None  # extraction resolves nothing
-    # The Day 1 resolver takes it from here, unchanged.
+    # Resolution takes it from here.
     assert executor.resolve_run(run_id) is AgentRunStatus.RESOLVED
-    assert (
-        executor.get_goal(run_id).user_id,
-        executor.get_goal(run_id).licence_id,
-    ) == (seed)
+    run = get_run(session_factory, run_id)
+    assert (run.resolved_user_id, run.resolved_licence_id) == seed
 
 
 @pytest.mark.parametrize(
@@ -311,98 +306,6 @@ def test_a_run_is_extracted_only_once(
     assert len(trace(session_factory, run_id)) == 1
 
 
-def test_a_run_created_with_an_intent_is_not_extracted(executor: AgentExecutor) -> None:
-    run_id = executor.create_run(
-        instruction=INSTRUCTION,
-        requesting_actor=HUMAN,
-        intent=ExtractedAssignmentIntent(user_email="ada@example.com", product="Figma"),
-    )
-    planner = FakePlanner(ada_figma())
-
-    with pytest.raises(RunNotExecutable):
-        executor.extract_intent(run_id, planner)
-
-    assert planner.instructions == []
-
-
-# --- the whole run, and its trace ---------------------------------------------
-
-
-def test_an_instruction_runs_to_completion_through_a_fake_planner(
-    executor: AgentExecutor, session_factory: Sessions, seed: tuple[int, int]
-) -> None:
-    run_id = run_instruction(
-        executor,
-        FakePlanner(ada_figma()),
-        instruction=INSTRUCTION,
-        requesting_actor=HUMAN,
-    )
-
-    run = get_run(session_factory, run_id)
-    assert (run.status, run.outcome_reason) == (
-        AgentRunStatus.COMPLETED,
-        OutcomeReason.GOAL_SATISFIED,
-    )
-    assert rows(session_factory, Assignment) == 1
-
-
-def test_trace_order_follows_sequence_numbers_when_timestamps_tie(
-    executor: AgentExecutor, session_factory: Sessions, seed: tuple[int, int]
-) -> None:
-    run_id = run_instruction(
-        executor,
-        FakePlanner(ada_figma()),
-        instruction=INSTRUCTION,
-        requesting_actor=HUMAN,
-    )
-    tie = datetime(2026, 9, 27, 12, 0, tzinfo=UTC)
-    with session_factory.begin() as session:
-        for model in (ModelCall, ToolCall):
-            session.execute(
-                update(model).where(model.agent_run_id == run_id).values(created_at=tie)
-            )
-
-    entries = trace(session_factory, run_id)
-
-    assert [
-        (
-            entry.sequence_no,
-            "model" if isinstance(entry, ModelCall) else entry.tool_name,
-        )
-        for entry in entries
-    ] == [
-        (1, "model"),
-        (2, "list_user_assignments"),
-        (3, "get_licence"),
-        (4, "assign_licence"),
-    ]
-    assert {entry.created_at for entry in entries} == {tie}
-    assert get_run(session_factory, run_id).last_sequence_no == 4
-
-
-def test_model_calls_and_tool_calls_share_one_counter_per_run(
-    executor: AgentExecutor, session_factory: Sessions, seed: tuple[int, int]
-) -> None:
-    first = run_instruction(
-        executor,
-        FakePlanner(ada_figma()),
-        instruction=INSTRUCTION,
-        requesting_actor=HUMAN,
-    )
-    second = received(executor)
-    executor.extract_intent(
-        second, FakePlanner(Unsupported(reason_code="not_a_request"))
-    )
-
-    assert [entry.sequence_no for entry in trace(session_factory, first)] == [
-        1,
-        2,
-        3,
-        4,
-    ]
-    assert [entry.sequence_no for entry in trace(session_factory, second)] == [1]
-
-
 # --- no lock is held while the planner runs ----------------------------------
 
 
@@ -435,15 +338,13 @@ def test_no_transaction_is_open_while_the_planner_runs(
             )
 
     executor = AgentExecutor(locking_sessions)
-    run_id = run_instruction(
-        executor,
-        FakePlanner(ada_figma(), during=business_write),
-        instruction=INSTRUCTION,
-        requesting_actor=HUMAN,
+    run_id = received(executor)
+
+    status = executor.extract_intent(
+        run_id, FakePlanner(ada_figma(), during=business_write)
     )
 
-    run = get_run(locking_sessions, run_id)
-    assert (run.status, run.outcome_reason) == (
-        AgentRunStatus.COMPLETED,
-        OutcomeReason.ALREADY_SATISFIED,
-    )
+    # The write made while the planner ran committed, and so did extraction.
+    assert status is AgentRunStatus.RECEIVED
+    assert rows(locking_sessions, Assignment) == 1
+    assert get_run(locking_sessions, run_id).extracted_product == "Figma"

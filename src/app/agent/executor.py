@@ -1,5 +1,8 @@
 """Runs an agent's steps with explicit transaction boundaries.
 
+A run's whole life is AgentExecutor.run: receive, extract, resolve, decide.
+Each step ends the run itself when it cannot go on.
+
 There are two kinds of transaction, and they are never open at the same time:
 
 - log transactions write AgentRun and ToolCall rows;
@@ -30,10 +33,10 @@ admission.
 Model calls and tool calls take their sequence_no from one per-run counter,
 so a run's trace has a single order that never depends on timestamps.
 
-Extraction (a natural-language run, from receive_run) follows the same rule.
-The run is persisted RECEIVED before any model is called. The planner then
-runs with no session open, and each model request it makes is recorded in
-its own LOG transaction as soon as the request has an outcome:
+Extraction follows the same rule. The run is persisted RECEIVED before any
+model is called. The planner then runs with no session open, and each model
+request it makes is recorded in its own LOG transaction as soon as the
+request has an outcome:
 
     LOG       ModelCall (per request, retries included)      COMMIT, close
     LOG       run's goal, or its outcome                     COMMIT, close
@@ -41,14 +44,13 @@ its own LOG transaction as soon as the request has an outcome:
 A crash during a model request leaves no row for it (the request changed no
 application state); the run stays RECEIVED without a goal.
 
-Decision (a model-directed run, from decide) keeps every rule above. What
-the model will be told is persisted, and the run starts EXECUTING, before
-any model request. The planner then runs with no session open. Each of its
-model requests is checked against the request limit and recorded in its
-own LOG transaction; each tool call it makes is an ordinary tool call (the
-three transactions above) through call_decision_tool, which checks the
-read or mutation limit in the first LOG transaction and persists the exact
-observation the model will be given in the last:
+Decision keeps every rule above. What the model will be told is persisted,
+and the run starts EXECUTING, before any model request. The planner then
+runs with no session open. Each of its model requests is checked against
+the request limit and recorded in its own LOG transaction; each tool call
+it makes goes through call_decision_tool (the three transactions above),
+which checks the read or mutation limit in the first LOG transaction and
+persists the exact observation the model will be given in the last:
 
     LOG       decision context (+ run -> EXECUTING)          COMMIT, close
               ... model requests and tool calls, as above ...
@@ -59,13 +61,13 @@ observation the model will be given in the last:
 Known crash windows (no recovery yet): a crash after the business commit
 but before the ToolCall's outcome is written leaves the call STARTED; the
 change is still traceable to the run through its audit actor
-"agent:run-<id>". A run with a STARTED call refuses further tool calls and
-verification (UnfinishedToolCall), so it is never retried blindly or
-labelled without knowing whether it made a change. A crash during a
-decision loop leaves the run EXECUTING with its trace so far; one after an
-over-limit tool call is recorded, before decide ends the run, leaves that
-refused call in it, and the same limit refuses any later one. A paused
-run's held call stays AWAITING_APPROVAL; nothing resumes it yet.
+"agent:run-<id>". The crash ends the decision loop, leaving the run
+EXECUTING, and nothing decides it again. Should a planner carry on anyway,
+a run with a STARTED call refuses further tool calls and verification
+(UnfinishedToolCall), so it is never labelled without knowing whether it
+made a change. A crash after an over-limit tool call is recorded, before
+decide ends the run, leaves that refused call in it. A paused run's held
+call stays AWAITING_APPROVAL; nothing resumes it yet.
 
 Tool calls within a run are serial. Nothing here coordinates concurrent
 callers on the same run: the status checks are read-then-write, not
@@ -133,7 +135,6 @@ from app.schemas.agent import (
     ToolInput,
     ToolOutput,
     Unsupported,
-    VerificationResult,
 )
 from app.services.assignments import AssignmentService
 from app.services.errors import (
@@ -173,16 +174,12 @@ _DOMAIN_ERROR_CODES: dict[type[DomainError], str] = {
     AssignmentAlreadyRevoked: "assignment_already_revoked",
 }
 
-# Expected domain rules that stop the goal: the run ends BLOCKED.
+# Domain rules that block the goal: a run whose latest assignment attempt
+# one of them rejected, and whose goal does not hold, ends BLOCKED.
 _BLOCKING_ERRORS: dict[str, OutcomeReason] = {
     "no_seats_available": OutcomeReason.NO_SEATS_AVAILABLE,
     "user_inactive": OutcomeReason.USER_INACTIVE,
 }
-
-# After this failure the goal may hold anyway: another transaction made the
-# same assignment first. The call is still recorded as FAILED, because it
-# did fail, but the run stays EXECUTING so the verifier can decide.
-_VERIFY_AFTER_ERRORS = frozenset({"assignment_already_exists"})
 
 
 class AgentRunNotFound(Exception):
@@ -233,8 +230,8 @@ class ToolCallOutcome:
     output: ToolOutput | None  # set if the call succeeded
     error: ToolError | None  # set if it failed or was refused
     run_status: AgentRunStatus  # the run's status after the call
-    # A decision call's persisted observation: the only part of the outcome
-    # a model is given. None for a deterministic call, and for a failure the
+    # The call's persisted observation: the only part of the outcome the
+    # model is given. None for a call that never ran, and for a failure the
     # model is not shown.
     observation: str | None = None
 
@@ -474,6 +471,31 @@ class AgentExecutor:
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         self._sessions = session_factory
 
+    def run(
+        self,
+        *,
+        instruction: str,
+        requesting_actor: str,
+        intent_planner: IntentPlanner,
+        decision_planner: DecisionPlanner,
+    ) -> int:
+        """Drive one natural-language run to a terminal status, or to an
+        approval pause (AWAITING_APPROVAL), and return its id.
+
+        Raises InvalidInput, recording nothing, for a blank or over-long
+        instruction or an invalid requesting actor. After that, a step that
+        cannot go on ends the run itself, and the next step is not taken.
+        """
+        run_id = self.receive_run(
+            instruction=instruction, requesting_actor=requesting_actor
+        )
+        if self.extract_intent(run_id, intent_planner) is not AgentRunStatus.RECEIVED:
+            return run_id
+        if self.resolve_run(run_id) is not AgentRunStatus.RESOLVED:
+            return run_id
+        self.decide(run_id, decision_planner)
+        return run_id
+
     # --- run lifecycle ----------------------------------------------------------
 
     def receive_run(self, *, instruction: str, requesting_actor: str) -> int:
@@ -482,7 +504,8 @@ class AgentExecutor:
 
         Nothing is extracted yet: the goal columns stay NULL until the
         instruction's intent is extracted. Raises InvalidInput, and records
-        nothing, exactly as create_run does. The instruction is stored
+        nothing, for a blank or over-long instruction or an invalid
+        requesting actor ("agent:" is reserved). The instruction is stored
         exactly as given.
         """
         requesting_actor = _validated_request(instruction, requesting_actor)
@@ -529,35 +552,6 @@ class AgentExecutor:
             _record_extraction(run, instruction, outcome)
             return run.status
 
-    def create_run(
-        self,
-        *,
-        instruction: str,
-        requesting_actor: str,
-        intent: ExtractedAssignmentIntent,
-    ) -> int:
-        """Persist a RECEIVED ensure-assignment run and return its id.
-
-        Raises InvalidInput, and records nothing, for a blank or over-long
-        instruction or an invalid requesting actor ("agent:" is reserved).
-        The instruction and extracted text are stored exactly as given.
-        """
-        requesting_actor = _validated_request(instruction, requesting_actor)
-
-        with self._sessions.begin() as log:
-            run = AgentRunRepository(log).add(
-                AgentRun(
-                    instruction=instruction,
-                    requesting_actor=requesting_actor,
-                    status=AgentRunStatus.RECEIVED,
-                    goal_type=GoalType.ENSURE_ASSIGNMENT,
-                    desired_state=DesiredState.ASSIGNED,
-                    extracted_user_email=intent.user_email,
-                    extracted_product=intent.product,
-                )
-            )
-            return run.id
-
     def resolve_run(self, run_id: int) -> AgentRunStatus:
         """Resolve the run's persisted extracted text to row ids.
 
@@ -600,11 +594,6 @@ class AgentExecutor:
                 run.resolved_licence_id = resolution.licence_id
                 transition(run, AgentRunStatus.RESOLVED)
             return run.status
-
-    def get_goal(self, run_id: int) -> ResolvedAssignmentGoal:
-        """The run's persisted resolved goal."""
-        with self._sessions() as log:
-            return _persisted_goal(self._get_run(log, run_id))
 
     # --- decision ---------------------------------------------------------------
 
@@ -688,10 +677,7 @@ class AgentExecutor:
         # LOG: the proposal is recorded as what it is, the model's opinion.
         with self._sessions.begin() as log:
             run = self._get_run(log, run_id)
-            if (
-                run.status is not AgentRunStatus.EXECUTING
-                or run.decision_context is None
-            ):
+            if run.status is not AgentRunStatus.EXECUTING:
                 raise RunNotExecutable(run_id, run.status)
             calls = ToolCallRepository(log)
             if calls.any_started(run.id):
@@ -764,47 +750,24 @@ class AgentExecutor:
 
     # --- tool calls -------------------------------------------------------------
 
-    def call_tool(self, run_id: int, args: ToolInput) -> ToolCallOutcome:
-        """Record and run one tool call; see the module docstring for the
-        three transactions.
-
-        A call naming anything outside the run's persisted goal is recorded
-        as FAILED (goal_scope_violation) and fails the run; no business
-        transaction is opened. A mutation within the goal is then checked
-        against policy: denied, it is recorded FAILED (policy_denied) and the
-        run ends BLOCKED; held for approval, it is recorded AWAITING_APPROVAL
-        and the run pauses. Neither opens a business transaction. Raises
-        RunNotExecutable, recording nothing, unless the run is RESOLVED or
-        EXECUTING with no unfinished call. A model-directed run is refused
-        too: its calls go through call_decision_tool, which counts them.
-        """
-        return self._call_tool(run_id, args, decision=False)
-
     def call_decision_tool(self, run_id: int, args: ToolInput) -> ToolCallOutcome:
-        """Record and run one tool call a decision model chose. As call_tool,
-        with three differences:
+        """Record and run one tool call a decision model chose; see the
+        module docstring for its three transactions.
 
-        - The call is counted against the run's read or mutation limit,
-          before policy. Over it, the call is recorded FAILED (step_limit),
-          no business transaction opens, and DecisionLimitExceeded is
-          raised.
-        - Its outcome's model-visible observation (observations.observe) is
-          serialized and persisted with the call, in the same transaction as
-          its outcome, and returned as ToolCallOutcome.observation.
-        - A rejection the model is shown leaves the run EXECUTING, so the
-          model may react; a blocking one counts when the run finishes. A
-          failure it is not shown ends the run, as in call_tool.
+        Admission (_start_call) may refuse the call, for its goal scope or a
+        decision limit, or policy may deny it or hold it for approval; then
+        no business transaction opens. Otherwise its outcome and the
+        observation the model is given (observations.observe) are persisted
+        together, and the observation is returned in
+        ToolCallOutcome.observation. A rejection the model is shown leaves
+        the run EXECUTING, so the model may react; a blocking one counts
+        when the run finishes. A failure it is not shown ends the run FAILED
+        (tool_failed).
 
         Raises RunNotExecutable, recording nothing, unless the run is in its
-        decision stage (EXECUTING, with a decision context) with no
-        unfinished call.
+        decision stage (EXECUTING) with no unfinished call.
         """
-        return self._call_tool(run_id, args, decision=True)
-
-    def _call_tool(
-        self, run_id: int, args: ToolInput, *, decision: bool
-    ) -> ToolCallOutcome:
-        started = self._start_call(run_id, args, decision=decision)
+        started = self._start_call(run_id, args)
         if isinstance(started, ToolCallOutcome):
             # Refused for its scope or denied by policy (the run has ended),
             # or held for approval (the run is paused). Never run.
@@ -828,20 +791,21 @@ class AgentExecutor:
             if call is None:
                 raise RuntimeError(f"Tool call {call_id} disappeared.")
             call.completed_at = utcnow()
-            observation = (
-                observations.observe(_persisted_goal(run), args, outcome)
-                if decision
-                else None
-            )
+            observation = observations.observe(_persisted_goal(run), args, outcome)
             if isinstance(outcome, ToolError):
                 call.status = ToolCallStatus.FAILED
                 call.error = outcome.model_dump(mode="json")
                 # Run serially, the run is still EXECUTING here. If an
                 # uncoordinated concurrent caller ended it meanwhile, the
                 # call's outcome is still recorded; the run's is left alone.
-                # A rejection shown to a decision model does not end it.
+                # A rejection shown to the model does not end it.
                 if run.status is AgentRunStatus.EXECUTING and observation is None:
-                    _end_run_after_failure(run, call, outcome)
+                    transition(
+                        run,
+                        AgentRunStatus.FAILED,
+                        reason=OutcomeReason.TOOL_FAILED,
+                        detail=_call_detail(call, outcome),
+                    )
             else:
                 call.status = ToolCallStatus.SUCCEEDED
                 call.result = outcome.model_dump(mode="json")
@@ -859,31 +823,20 @@ class AgentExecutor:
             )
 
     def _start_call(
-        self, run_id: int, args: ToolInput, *, decision: bool
+        self, run_id: int, args: ToolInput
     ) -> ToolCallOutcome | tuple[int, str]:
         """LOG: admit the call, record it as STARTED and return its id and
         audit actor; or record why it was refused, denied or held, and
         return (or raise) that instead.
 
         Checked in this order, in this one transaction: the run's status and
-        unfinished calls, the goal scope, a decision run's limits, and last,
-        for a mutation that passed them, policy. So a call refused for its
-        scope or a limit is never evaluated, and its policy_decision stays
-        NULL.
+        unfinished calls, the goal scope, the run's limits, and last, for a
+        mutation that passed them, policy. So a call refused for its scope
+        or a limit is never evaluated, and its policy_decision stays NULL.
         """
         with self._sessions.begin() as log:
             run = self._get_run(log, run_id)
-            if decision:
-                allowed = (
-                    run.status is AgentRunStatus.EXECUTING
-                    and run.decision_context is not None
-                )
-            else:
-                allowed = (
-                    run.status in (AgentRunStatus.RESOLVED, AgentRunStatus.EXECUTING)
-                    and run.decision_context is None
-                )
-            if not allowed:
+            if run.status is not AgentRunStatus.EXECUTING:
                 raise RunNotExecutable(run_id, run.status)
             calls = ToolCallRepository(log)
             if calls.any_started(run.id):
@@ -916,12 +869,8 @@ class AgentExecutor:
                     run_status=run.status,
                 )
 
-            refused = _decision_limit(calls, run.id, args) if decision else None
+            refused = _decision_limit(calls, run.id, args)
             if refused is None:
-                # A first call moves a Day 1 run to EXECUTING, whatever policy
-                # then decides.
-                if run.status is AgentRunStatus.RESOLVED:
-                    transition(run, AgentRunStatus.EXECUTING)
                 # Read from committed state, here: atomic with the recorded
                 # decision, not with the business transaction that follows.
                 policy_decision = policy.evaluate(args, LicenceService(log))
@@ -948,60 +897,6 @@ class AgentExecutor:
             calls.add(call)
         # Raised after the commit, so the refused call stays recorded.
         raise refused
-
-    # --- verification -----------------------------------------------------------
-
-    def verify_and_finish(self, run_id: int) -> AgentRunStatus:
-        """Verify the persisted goal against current state and end the run.
-
-        The only way a run becomes COMPLETED. The verifier reads through a
-        new session, so it sees committed state, never an earlier session's
-        objects or any tool's result. Refused while a tool call has no
-        recorded outcome: whether this run made a change would be unknown.
-        A model-directed run is refused (RunNotExecutable): it ends through
-        decide, which records its proposal.
-        """
-        with self._sessions.begin() as log:
-            run = self._get_run(log, run_id)
-            if run.decision_context is not None:
-                raise RunNotExecutable(run_id, run.status)
-            if ToolCallRepository(log).any_started(run.id):
-                raise UnfinishedToolCall(run_id, run.status)
-            transition(run, AgentRunStatus.VERIFYING)
-            goal = _persisted_goal(run)
-
-        result: VerificationResult
-        try:
-            with self._sessions() as read:
-                result = verify(AssignmentService(read), goal)
-        except Exception as error:
-            return self._fail(run_id, _unexpected_detail("verification", error))
-
-        with self._sessions.begin() as log:
-            run = self._get_run(log, run_id)
-            detail = result.model_dump(mode="json")
-            if not result.satisfied:
-                transition(
-                    run,
-                    AgentRunStatus.FAILED,
-                    reason=OutcomeReason.VERIFICATION_FAILED,
-                    detail=detail,
-                )
-            else:
-                changed = ToolCallRepository(log).any_succeeded(
-                    run.id, tools.MUTATING_TOOL_NAMES
-                )
-                transition(
-                    run,
-                    AgentRunStatus.COMPLETED,
-                    reason=(
-                        OutcomeReason.GOAL_SATISFIED
-                        if changed
-                        else OutcomeReason.ALREADY_SATISFIED
-                    ),
-                    detail=detail,
-                )
-            return run.status
 
     # --- helpers ----------------------------------------------------------------
 
@@ -1112,21 +1007,3 @@ def _blocking_rejection(attempt: ToolCall | None) -> OutcomeReason | None:
     if attempt.error is None:
         return None
     return _BLOCKING_ERRORS.get(attempt.error["code"])
-
-
-def _end_run_after_failure(run: AgentRun, call: ToolCall, error: ToolError) -> None:
-    blocked_reason = _BLOCKING_ERRORS.get(error.code)
-    if blocked_reason is not None:
-        transition(
-            run,
-            AgentRunStatus.BLOCKED,
-            reason=blocked_reason,
-            detail=_call_detail(call, error),
-        )
-    elif error.code not in _VERIFY_AFTER_ERRORS:
-        transition(
-            run,
-            AgentRunStatus.FAILED,
-            reason=OutcomeReason.TOOL_FAILED,
-            detail=_call_detail(call, error),
-        )

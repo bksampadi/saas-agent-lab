@@ -1,22 +1,19 @@
-"""Policy at call admission: allow, deny and require_approval, on the Day 1
-(direct) path and the model-directed path.
+"""Policy at call admission: allow, deny and require_approval.
 
 A mutation is checked against policy when AgentExecutor._start_call admits
 it, after its goal scope and the run's limits. Denied, it never runs and the
 run ends BLOCKED; held for approval, it never runs and the run pauses. In
 both cases no business transaction opens, and a model is asked nothing more.
-The model-directed tests drive the real PydanticAI planner with a scripted
-model (FunctionModel), so the stop is checked through the actual tool
-scheduling and exception propagation.
+The tests drive the real PydanticAI planner with a scripted model
+(FunctionModel), so the stop is checked through the actual tool scheduling
+and exception propagation.
 """
 
 from collections.abc import Callable
 from typing import Any
 
 import pytest
-from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
-from pydantic_ai.models.function import AgentInfo, FunctionModel
-from pydantic_ai.usage import RequestUsage
+from pydantic_ai.messages import ModelResponse
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -24,9 +21,6 @@ import app.agent.executor as executor_module
 from app.agent import policy, tools
 from app.agent.decision_tools import GoalBoundTools
 from app.agent.executor import AgentExecutor, RunNotExecutable, ToolCallOutcome
-from app.agent.harness import run_ensure_assignment
-from app.agent.pydantic_ai_decision import PydanticAIDecisionPlanner
-from app.agent.status import IllegalTransition
 from app.models import (
     AgentRun,
     AgentRunStatus,
@@ -42,7 +36,7 @@ from app.models import (
 from app.repositories.tool_calls import ToolCallRepository
 from app.schemas.agent import (
     AssignLicenceInput,
-    ExtractedAssignmentIntent,
+    EnsureAssignmentIntent,
     GetLicenceInput,
     GetUserInput,
     ListUserAssignmentsInput,
@@ -50,8 +44,19 @@ from app.schemas.agent import (
     ToolInput,
 )
 from app.services.licences import LicenceService
+from support import (
+    ASSIGN,
+    ASSIGNMENTS,
+    CAPACITY,
+    GOAL_REACHED,
+    USER,
+    FixedIntent,
+    Script,
+    call,
+    directed_run,
+    resolved_run,
+)
 
-HUMAN = "admin@example.com"
 Sessions = sessionmaker[Session]
 S = AgentRunStatus
 R = OutcomeReason
@@ -62,49 +67,6 @@ AWAITING = ToolCallStatus.AWAITING_APPROVAL
 
 ADA = 48213
 FIGMA = 97531
-SLACK = 97532
-
-Step = ModelResponse | Callable[[], ModelResponse]
-
-
-# --- scripted model -----------------------------------------------------------
-
-
-class Script:
-    """A FunctionModel that answers with ``steps`` in order, and keeps every
-    request it was sent. A callable step runs when the request arrives (to
-    change state between requests). Steps left over were never requested."""
-
-    def __init__(self, *steps: Step) -> None:
-        self.steps = list(steps)
-        self.requests: list[list[ModelMessage]] = []
-
-    def respond(self, messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        self.requests.append(list(messages))
-        step = self.steps.pop(0)
-        return step if isinstance(step, ModelResponse) else step()
-
-    def planner(self) -> PydanticAIDecisionPlanner:
-        return PydanticAIDecisionPlanner(
-            FunctionModel(self.respond, model_name="scripted-model"), timeout_seconds=5
-        )
-
-
-def call(*tool_names: str) -> ModelResponse:
-    return ModelResponse(
-        parts=[ToolCallPart(name, {}) for name in tool_names],
-        usage=RequestUsage(input_tokens=100, output_tokens=10),
-    )
-
-
-GOAL_REACHED = ModelResponse(
-    parts=[ToolCallPart("goal_reached", {})],
-    usage=RequestUsage(input_tokens=100, output_tokens=10),
-)
-USER = "get_target_user"
-CAPACITY = "get_target_licence_capacity"
-ASSIGNMENTS = "list_target_user_assignments"
-ASSIGN = "assign_target_licence"
 
 
 # --- database -----------------------------------------------------------------
@@ -127,22 +89,11 @@ def set_policy(sessions: Sessions, agent_policy: PolicyDecision) -> None:
         )
 
 
-def resolved_run(executor: AgentExecutor) -> int:
-    run_id = executor.create_run(
-        instruction="Give ada@example.com a Figma seat.",
-        requesting_actor=HUMAN,
-        intent=ExtractedAssignmentIntent(user_email="ada@example.com", product="Figma"),
-    )
-    assert executor.resolve_run(run_id) is S.RESOLVED
-    return run_id
-
-
-def harness_run(executor: AgentExecutor) -> int:
-    return run_ensure_assignment(
-        executor,
-        instruction="Give ada@example.com a Figma seat.",
-        requesting_actor=HUMAN,
-        intent=ExtractedAssignmentIntent(user_email="ada@example.com", product="Figma"),
+def full_run(executor: AgentExecutor) -> int:
+    """A whole run whose model reads, then tries to assign, then claims
+    success."""
+    return directed_run(
+        executor, Script(call(ASSIGNMENTS), call(CAPACITY), call(ASSIGN), GOAL_REACHED)
     )
 
 
@@ -258,7 +209,7 @@ def test_an_empty_outcome_can_only_mean_a_call_held_for_approval() -> None:
             )
 
 
-# --- the Day 1 (direct) path -----------------------------------------------------
+# --- each decision, recorded with its call ---------------------------------------
 
 
 def test_an_allowed_assignment_runs_as_before_and_records_the_decision(
@@ -266,7 +217,7 @@ def test_an_allowed_assignment_runs_as_before_and_records_the_decision(
 ) -> None:
     seed(session_factory, ALLOW)
 
-    run_id = harness_run(executor)
+    run_id = full_run(executor)
 
     run = get_run(session_factory, run_id)
     assert (run.status, run.outcome_reason) == (S.COMPLETED, R.GOAL_SATISFIED)
@@ -289,7 +240,7 @@ def test_a_denied_assignment_never_runs_and_blocks_the_run(
 ) -> None:
     seed(session_factory, DENY)
 
-    run_id = harness_run(executor)
+    run_id = full_run(executor)
 
     run = get_run(session_factory, run_id)
     assert (run.status, run.outcome_reason) == (S.BLOCKED, R.POLICY_DENIED)
@@ -316,7 +267,7 @@ def test_a_held_assignment_never_runs_and_pauses_the_run(
 ) -> None:
     seed(session_factory, REQUIRE)
 
-    run_id = harness_run(executor)
+    run_id = full_run(executor)
 
     run = get_run(session_factory, run_id)
     assert (run.status, run.outcome_reason, run.outcome_detail, run.completed_at) == (
@@ -362,9 +313,7 @@ def test_a_denied_or_held_mutation_opens_no_business_transaction(
     monkeypatch.setattr(executor_module, "_tool_context", no_business)
     first = len(statements)
 
-    outcome = executor.call_tool(
-        run_id, AssignLicenceInput(user_id=ADA, licence_id=FIGMA)
-    )
+    status = executor.decide(run_id, Script(call(ASSIGN), GOAL_REACHED).planner())
 
     assert contexts == []
     sent = " ".join(statements[first:])
@@ -372,60 +321,38 @@ def test_a_denied_or_held_mutation_opens_no_business_transaction(
     assert "assignments" not in sent and "audit_events" not in sent
     assert "licences" in sent
     assert mutations(session_factory) == (0, 0)
+    (stopped,) = tool_calls(session_factory, run_id)
+    assert (stopped.result, stopped.observation) == (None, None)
     if agent_policy is DENY:
-        assert outcome.run_status is S.BLOCKED
-        assert outcome.error is not None and outcome.error.code == "policy_denied"
-        assert outcome.output is None
+        assert status is S.BLOCKED
+        assert stopped.error is not None and stopped.error["code"] == "policy_denied"
     else:
-        # Distinguished by run_status: held, not an empty success.
-        assert outcome.run_status is S.AWAITING_APPROVAL
-        assert (outcome.output, outcome.error, outcome.observation) == (
-            None,
-            None,
-            None,
-        )
+        assert status is S.AWAITING_APPROVAL
+        assert stopped.error is None
 
 
-def paused_by_harness(executor: AgentExecutor, sessions: Sessions) -> int:
-    return harness_run(executor)
-
-
-def paused_by_model(executor: AgentExecutor, sessions: Sessions) -> int:
-    run_id = resolved_run(executor)
-    executor.decide(run_id, Script(call(ASSIGN)).planner())
-    return run_id
-
-
-@pytest.mark.parametrize(
-    "pause", [paused_by_harness, paused_by_model], ids=["direct", "model-directed"]
-)
 def test_a_paused_run_refuses_every_further_step(
-    executor: AgentExecutor,
-    session_factory: Sessions,
-    pause: Callable[[AgentExecutor, Sessions], int],
+    executor: AgentExecutor, session_factory: Sessions
 ) -> None:
     seed(session_factory, REQUIRE)
-    run_id = pause(executor, session_factory)
+    run_id = resolved_run(executor)
+    executor.decide(run_id, Script(call(ASSIGN)).planner())
     before = get_run(session_factory, run_id)
     assert before.status is S.AWAITING_APPROVAL
     calls_before = len(tool_calls(session_factory, run_id))
 
+    intent = EnsureAssignmentIntent(user_email="ada@example.com", product="Figma")
     assign = AssignLicenceInput(user_id=ADA, licence_id=FIGMA)
     steps: list[Callable[[], object]] = [
-        lambda: executor.call_tool(run_id, GetUserInput(user_id=ADA)),
-        lambda: executor.call_tool(run_id, assign),
-        lambda: executor.call_decision_tool(run_id, assign),
-        lambda: executor.decide(run_id, Script(GOAL_REACHED).planner()),
+        lambda: executor.extract_intent(run_id, FixedIntent(intent)),
         lambda: executor.resolve_run(run_id),
+        lambda: executor.decide(run_id, Script(GOAL_REACHED).planner()),
+        lambda: executor.call_decision_tool(run_id, GetUserInput(user_id=ADA)),
+        lambda: executor.call_decision_tool(run_id, assign),
     ]
     for step in steps:
         with pytest.raises(RunNotExecutable):
             step()
-    # A model-directed run is refused before anything else (it ends through
-    # decide); a direct one at the transition, as for any status that
-    # verification cannot follow.
-    with pytest.raises((RunNotExecutable, IllegalTransition)):
-        executor.verify_and_finish(run_id)
 
     after = get_run(session_factory, run_id)
     assert (after.status, after.last_sequence_no) == (
@@ -437,29 +364,6 @@ def test_a_paused_run_refuses_every_further_step(
 
 
 # --- the order of admission checks -------------------------------------------------
-
-
-def test_a_call_outside_the_goal_is_refused_before_policy_is_evaluated(
-    executor: AgentExecutor, session_factory: Sessions, evaluations: list[str]
-) -> None:
-    seed(session_factory, DENY)
-    with session_factory.begin() as session:
-        session.add(Licence(id=SLACK, product="Slack", seats_total=5))
-    run_id = resolved_run(executor)
-
-    outcome = executor.call_tool(
-        run_id, AssignLicenceInput(user_id=ADA, licence_id=SLACK)
-    )
-
-    assert outcome.run_status is S.FAILED
-    assert get_run(session_factory, run_id).outcome_reason is R.GOAL_SCOPE_VIOLATION
-    (refused,) = tool_calls(session_factory, run_id)
-    assert refused.error is not None
-    assert (refused.error["code"], refused.policy_decision) == (
-        "goal_scope_violation",
-        None,
-    )
-    assert evaluations == []
 
 
 def test_a_mutation_over_the_limit_is_refused_before_policy_is_evaluated(

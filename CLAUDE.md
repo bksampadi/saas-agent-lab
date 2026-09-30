@@ -12,10 +12,10 @@ Latest release: `v0.3.0` (everything below through Day 2C). `main` is in develop
 - Day 1, deterministic agent execution foundation: complete. Persisted `AgentRun` and `ToolCall`, deterministic resolver, persisted resolved goal, goal-scoped executor with separate log and business transactions, audit actor `agent:run-<id>`, state-based verifier.
 - Day 2A, natural-language intent extraction: complete. PydanticAI turns an instruction into a closed `ExtractedIntent` union (`EnsureAssignmentIntent | NeedsClarification | Unsupported`). Every model request is persisted as a `ModelCall`; model calls and tool calls share one ordered trace per run.
 - Day 2B, bounded model-directed execution: complete. `AgentExecutor.decide` lets a model choose among four argument-free tools bound to the run's persisted goal (`agent/decision_tools.py`), executed through the Day 1 executor. The model concludes with a closed proposal (`GoalReached | NoActionNeeded | CannotProceed`). Id-free observations are persisted on each `ToolCall`, and the initial context on the run. Limits are enforced by application code (`step_limit`). The run's outcome comes from `decision.decision_outcome`, never from the proposal.
-- Day 2C, HTTP surface and live smoke test: complete. `POST /agent-runs` runs `harness.run_directed_instruction` synchronously through `agent/runs.py`; `GET /agent-runs/{run_id}` returns the persisted run, decision context, verification and ordered trace, id-free (`schemas/agent_runs.py`). One opt-in live test (`tests/live/`, marker `live`) drives a real model end to end.
+- Day 2C, HTTP surface and live smoke test: complete. `POST /agent-runs` runs `AgentExecutor.run` synchronously through `agent/runs.py`; `GET /agent-runs/{run_id}` returns the persisted run, decision context, verification and ordered trace, id-free (`schemas/agent_runs.py`). One opt-in live test (`tests/live/`, marker `live`) drives a real model end to end.
 - Next: policy checks, approval checkpoints and cancellation, the first work after `v0.3.0` (see Roadmap). Not started.
 
-LLM and model integration is permitted, within the authority boundary below. `harness.run_instruction` still runs the deterministic Day 1 steps after extraction; `harness.run_directed_instruction` hands the resolved run to a decision planner, and is what the API runs.
+LLM and model integration is permitted, within the authority boundary below. `AgentExecutor.run` is the only execution path: receive, extract, resolve, then hand the resolved run to a decision planner (`decide`). The Day 1 deterministic path was removed after `v0.3.0`.
 
 ## Authority boundary
 
@@ -63,7 +63,7 @@ Then a public release.
 
 ## Agent rules
 
-- `agent/` holds the executor, resolver, verifier, tools, observations, the decision contract (limits, context, outcome table), harness and planners. The executor opens its own short sessions: log transactions (runs, tool calls, model calls) and business transactions are never open at the same time, and no session is open while a model runs.
+- `agent/` holds the executor, resolver, verifier, tools, observations, the decision contract (limits, context, outcome table) and planners. The executor opens its own short sessions: log transactions (runs, tool calls, model calls) and business transactions are never open at the same time, and no session is open while a model runs.
 - A model reaches the application only through a planner interface (`agent/planner.py`) with a fake-able implementation. Model output is a closed Pydantic union with `extra="forbid"`: no id fields, no free-form fields.
 - Every model request, accepted, rejected or failed, is persisted as a `ModelCall` as soon as it has an outcome. Retries are bounded by explicit constants.
 - `AgentRun.last_sequence_no` orders the trace and nothing else. It is not a limit.
