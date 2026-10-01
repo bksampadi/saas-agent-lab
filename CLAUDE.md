@@ -11,7 +11,7 @@ Latest release: `v0.3.0` (everything below through Day 2C). `main` is in develop
 - v0.1 SaaS application: complete.
 - Day 1, deterministic agent execution foundation: complete. Persisted `AgentRun` and `ToolCall`, deterministic resolver, persisted resolved goal, goal-scoped executor with separate log and business transactions, audit actor `agent:run-<id>`, state-based verifier.
 - Day 2A, natural-language intent extraction: complete. PydanticAI turns an instruction into a closed `ExtractedIntent` union (`EnsureAssignmentIntent | NeedsClarification | Unsupported`). Every model request is persisted as a `ModelCall`; model calls and tool calls share one ordered trace per run.
-- Day 2B, bounded model-directed execution: complete. `AgentExecutor.decide` lets a model choose among four argument-free tools bound to the run's persisted goal (`agent/decision_tools.py`), executed through the Day 1 executor. The model concludes with a closed proposal (`GoalReached | NoActionNeeded | CannotProceed`). Id-free observations are persisted on each `ToolCall`, and the initial context on the run. Limits are enforced by application code (`step_limit`). The run's outcome comes from `decision.decision_outcome`, never from the proposal.
+- Day 2B, bounded model-directed execution: complete. `AgentExecutor.decide` lets a model choose among four argument-free tools bound to the run's persisted goal (`agent/tools.py`), each call admitted and run by `AgentExecutor.call_tool`. The model concludes with a closed proposal (`GoalReached | NoActionNeeded | CannotProceed`). Id-free observations are persisted on each `ToolCall`, and the initial context on the run. Limits are enforced by application code (`step_limit`). The run's outcome comes from `decision.decision_outcome`, never from the proposal.
 - Day 2C, HTTP surface and live smoke test: complete. `POST /agent-runs` runs `AgentExecutor.run` synchronously through `agent/runs.py`; `GET /agent-runs/{run_id}` returns the persisted run, decision context, verification and ordered trace, id-free (`schemas/agent_runs.py`). One opt-in live test (`tests/live/`, marker `live`) drives a real model end to end.
 - Next: policy checks, approval checkpoints and cancellation, the first work after `v0.3.0` (see Roadmap). Not started.
 
@@ -74,10 +74,10 @@ Then a public release.
 
 ## Decision-stage rules
 
-- Model-facing tools take no arguments. The model chooses the capability; `GoalBoundTools` builds the call from the run's persisted goal and sends it through `AgentExecutor.call_decision_tool`. Never add an entity argument to a model-facing tool.
+- Model-facing tools take no arguments. The model chooses the capability by name; `AgentExecutor.call_tool` builds the call from the run's persisted goal. Never add an entity argument to a model-facing tool.
 - Keep three representations of a tool call's result distinct:
   1. the internal executor result: may contain entity and database ids; used only by deterministic application code;
-  2. the model-visible observation (`agent/observations.py`): a separate closed DTO with no entity or database ids, only what is intentionally shown to the model;
+  2. the model-visible observation (`tools.observe`): a separate closed DTO with no entity or database ids, only what is intentionally shown to the model;
   3. the persisted model-visible observation (`ToolCall.observation`): the exact, deterministic serialization of (2), written with the call's outcome and returned to the model as that same text.
   Never use the internal result itself as the model observation, and never build model-visible text from `str(exception)`: rejections are closed reason codes.
 - The initial model context (instructions and prompt) contains no ids and is persisted verbatim on the run (`decision_context`) before the first request.

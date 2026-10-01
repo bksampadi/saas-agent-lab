@@ -24,7 +24,7 @@ from sqlalchemy.pool import QueuePool
 import app.agent.executor as executor_module
 from app.agent import tools
 from app.agent.executor import AgentExecutor
-from app.agent.planner import DecisionModelCallRecorder, TargetTools
+from app.agent.planner import CallTool, DecisionModelCallRecorder
 from app.core.database import create_db_engine
 from app.models import (
     AgentRun,
@@ -42,11 +42,13 @@ from app.models import (
 from app.repositories.assignments import AssignmentRepository
 from app.repositories.tool_calls import ToolCallRepository
 from app.schemas.agent import (
-    AssignLicenceInput,
     AssignmentSnapshot,
     DecisionContext,
     DecisionProposal,
     GoalReached,
+    ResolvedAssignmentGoal,
+    TargetToolName,
+    ToolOutput,
 )
 from app.services.assignments import AssignmentService
 from app.services.users import UserService
@@ -325,17 +327,23 @@ def verifier_crashes(e: AgentExecutor, s: Sessions, m: pytest.MonkeyPatch) -> No
 def verification_fails(e: AgentExecutor, s: Sessions, m: pytest.MonkeyPatch) -> None:
     add(s, Licence(product="Figma", seats_total=5))
 
-    def lying_assign(context: Any, args: AssignLicenceInput) -> AssignmentSnapshot:
+    real_run = tools.run
+
+    def lying_run(
+        tool: TargetToolName, goal: ResolvedAssignmentGoal, **services: Any
+    ) -> ToolOutput:
+        if tool != ASSIGN:
+            return real_run(tool, goal, **services)
         return AssignmentSnapshot(
             assignment_id=999,
-            user_id=args.user_id,
-            licence_id=args.licence_id,
+            user_id=goal.user_id,
+            licence_id=goal.licence_id,
             active=True,
             assigned_at=datetime.now(UTC),
             revoked_at=None,
         )
 
-    m.setattr(tools, "assign_licence", lying_assign)
+    m.setattr(tools, "run", lying_run)
     run(e)
 
 
@@ -380,9 +388,9 @@ def crash_after_business_commit(
         raise Crash
 
     def assign(
-        context: DecisionContext, target: TargetTools, calls: DecisionModelCallRecorder
+        context: DecisionContext, call_tool: CallTool, calls: DecisionModelCallRecorder
     ) -> DecisionProposal:
-        target.assign_target_licence()
+        call_tool(ASSIGN)
         return GoalReached()
 
     m.setattr(ToolCallRepository, "get", crash)

@@ -15,7 +15,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RequestUsage
 
 from app.agent.executor import AgentExecutor
-from app.agent.planner import DecisionModelCallRecorder, ModelCallRecorder, TargetTools
+from app.agent.planner import CallTool, DecisionModelCallRecorder, ModelCallRecorder
 from app.agent.pydantic_ai_decision import PydanticAIDecisionPlanner
 from app.models import AgentRunStatus
 from app.schemas.agent import (
@@ -23,16 +23,17 @@ from app.schemas.agent import (
     DecisionProposal,
     EnsureAssignmentIntent,
     ExtractedIntent,
+    TargetToolName,
 )
 
 HUMAN = "admin@example.com"
 MODEL = "scripted-model"
 
 # The model-facing tools and conclusions, by the names the model sees.
-USER = "get_target_user"
-CAPACITY = "get_target_licence_capacity"
-ASSIGNMENTS = "list_target_user_assignments"
-ASSIGN = "assign_target_licence"
+USER: TargetToolName = "get_target_user"
+CAPACITY: TargetToolName = "get_target_licence_capacity"
+ASSIGNMENTS: TargetToolName = "list_target_user_assignments"
+ASSIGN: TargetToolName = "assign_target_licence"
 PROPOSALS = frozenset({"goal_reached", "no_action_needed", "cannot_proceed"})
 
 
@@ -162,9 +163,7 @@ def directed_run(
 
 # --- a planner without a model ------------------------------------------------
 
-Act = Callable[
-    [DecisionContext, TargetTools, DecisionModelCallRecorder], DecisionProposal
-]
+Act = Callable[[DecisionContext, CallTool, DecisionModelCallRecorder], DecisionProposal]
 
 
 class FakeDecisionPlanner:
@@ -177,8 +176,8 @@ class FakeDecisionPlanner:
     def decide(
         self,
         context: DecisionContext,
-        tools: TargetTools,
+        call_tool: CallTool,
         calls: DecisionModelCallRecorder,
     ) -> DecisionProposal:
         self.contexts.append(context)
-        return self.act(context, tools, calls)
+        return self.act(context, call_tool, calls)

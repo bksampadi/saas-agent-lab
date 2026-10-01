@@ -35,11 +35,11 @@ class ToolCall(Base):
     accidental concurrent allocation into an error instead of a tie.
 
     ``result`` and ``error`` are internal and may hold row ids.
-    ``observation`` is set only on a call a decision model made: the exact
-    text the model was given as the call's result, id-free by construction.
+    ``observation`` is the exact text the model was given as the call's
+    result, id-free by construction; NULL when it was given nothing.
     ``policy_decision`` is what policy decided when the call was admitted
-    (app.agent.policy): set for a mutating call that passed the goal-scope
-    and limit checks, NULL for a read and for a call refused before policy.
+    (app.agent.policy): set for a mutating call within the run's limits,
+    NULL for a read and for a call refused before policy.
     """
 
     __tablename__ = "tool_calls"

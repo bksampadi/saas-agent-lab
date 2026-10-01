@@ -1,7 +1,7 @@
 """Contracts of the agent layer: what a planner may extract from an
-instruction, the goal the resolver produces, tool arguments and results,
-model-call records, the verifier's result, and what crosses the model
-boundary in the decision stage.
+instruction, the goal the resolver produces, tool results, model-call
+records, the verifier's result, and what crosses the model boundary in the
+decision stage.
 
 Tool results are structured facts read from the application at one moment
 (snapshots), never prose summaries. A later read may disagree with them.
@@ -11,7 +11,7 @@ id-free observation.
 """
 
 from datetime import datetime
-from typing import Annotated, Any, ClassVar, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
@@ -24,7 +24,6 @@ from app.models import (
     User,
     UserStatus,
 )
-from app.schemas.assignment import EntityId
 from app.services.assignments import SeatUsage
 
 # A storage bound only; the resolver applies the domain's own limits.
@@ -168,50 +167,6 @@ class ResolutionFailure(BaseModel):
     detail: dict[str, Any]  # JSON-safe values only
 
 
-# --- tool arguments -----------------------------------------------------------
-
-
-class ToolInputBase(BaseModel):
-    """Arguments of one tool. Every id must equal the run's resolved goal;
-    the executor checks that before anything runs."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    tool_name: ClassVar[str]
-    mutating: ClassVar[bool] = False
-
-
-class GetUserInput(ToolInputBase):
-    tool_name: ClassVar[str] = "get_user"
-
-    user_id: EntityId
-
-
-class GetLicenceInput(ToolInputBase):
-    tool_name: ClassVar[str] = "get_licence"
-
-    licence_id: EntityId
-
-
-class ListUserAssignmentsInput(ToolInputBase):
-    tool_name: ClassVar[str] = "list_user_assignments"
-
-    user_id: EntityId
-
-
-class AssignLicenceInput(ToolInputBase):
-    tool_name: ClassVar[str] = "assign_licence"
-    mutating: ClassVar[bool] = True
-
-    user_id: EntityId
-    licence_id: EntityId
-
-
-ToolInput = (
-    GetUserInput | GetLicenceInput | ListUserAssignmentsInput | AssignLicenceInput
-)
-
-
 # --- tool results -------------------------------------------------------------
 
 
@@ -332,7 +287,7 @@ class BlockCheck(BaseModel):
 # --- model-visible observations -----------------------------------------------
 #
 # A tool call's outcome as a model sees it: a separate, closed DTO built from
-# the internal result by app.agent.observations. It carries only what the
+# the internal result by app.agent.tools.observe. It carries only what the
 # model needs to decide: no id field, no free-form field, no dictionary, and
 # extra="forbid" rejects anything not declared.
 

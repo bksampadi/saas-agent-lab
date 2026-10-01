@@ -16,6 +16,7 @@ request has an outcome, so each one is persisted, in trace order, even when
 planning then fails.
 """
 
+from collections.abc import Callable
 from typing import Protocol
 
 from app.schemas.agent import (
@@ -24,6 +25,7 @@ from app.schemas.agent import (
     EnsureAssignmentIntent,
     ExtractedIntent,
     ModelCallRecord,
+    TargetToolName,
 )
 
 
@@ -45,39 +47,29 @@ class IntentPlanner(Protocol):
 
 class DecisionModelCallRecorder(ModelCallRecorder, Protocol):
     def before_request(self) -> None:
-        """Call before every model request. Raises DecisionLimitExceeded,
-        and the request must not be made, if it would exceed the stage's
-        request limit."""
+        """Call before every model request. If it would exceed the stage's
+        request limit, the run is ended and DecisionStopped raised: the
+        request must not be made."""
         ...
 
 
-class TargetTools(Protocol):
-    """The decision model's tools, bound by the application to the run's
-    resolved goal. None takes an argument, so nothing a model says can name
-    a user, licence or assignment.
-
-    Each returns the call's observation: the exact text persisted with the
-    call. Each may raise DecisionStopped (a limit, or a failure that ended
-    the run), which must end the planner's loop at once.
-    """
-
-    def get_target_user(self) -> str: ...
-
-    def get_target_licence_capacity(self) -> str: ...
-
-    def list_target_user_assignments(self) -> str: ...
-
-    def assign_target_licence(self) -> str: ...
+# Runs one of the decision model's tools for the run, by its name, and
+# returns the call's observation: the exact text persisted with the call.
+# The run's goal is bound in by the application, and no tool takes an
+# argument, so nothing a model says can name a user, licence or assignment.
+# May raise DecisionStopped (a limit, policy, or a failure that ended the
+# run), which must end the planner's loop at once.
+CallTool = Callable[[TargetToolName], str]
 
 
 class DecisionPlanner(Protocol):
     def decide(
         self,
         context: DecisionContext,
-        tools: TargetTools,
+        call_tool: CallTool,
         calls: DecisionModelCallRecorder,
     ) -> DecisionProposal:
-        """Call ``tools`` as the model chooses, then return its proposal.
+        """Call tools as the model chooses, then return its proposal.
 
         ``context`` is exactly what the model is to be sent first; it is
         already persisted. Raises PlannerError when no acceptable answer was

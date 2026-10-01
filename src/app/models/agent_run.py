@@ -60,6 +60,8 @@ class OutcomeReason(StrEnum):
     POLICY_DENIED = "policy_denied"  # policy denied the run's mutation
     # FAILED
     PLANNER_ERROR = "planner_error"  # at any model stage; the detail names it
+    # No longer produced: tool calls take their ids from the persisted goal.
+    # Kept for runs recorded before that, which the CHECK constraint allows.
     GOAL_SCOPE_VIOLATION = "goal_scope_violation"
     TOOL_FAILED = "tool_failed"
     VERIFICATION_FAILED = "verification_failed"

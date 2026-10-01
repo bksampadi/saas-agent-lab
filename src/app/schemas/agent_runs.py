@@ -17,7 +17,7 @@ from typing import Annotated, Any, Literal, Self, assert_never
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
-from app.agent.decision_tools import MODEL_TOOL_NAMES
+from app.agent import tools
 from app.agent.executor import INSTRUCTION_MAX_LENGTH
 from app.models import (
     AgentRun,
@@ -147,6 +147,12 @@ ModelCallOutput = Annotated[
 ]
 _MODEL_CALL_OUTPUT: TypeAdapter[ModelCallOutput] = TypeAdapter(ModelCallOutput)
 
+# Each tool call is recorded under the application operation's name; the
+# trace shows the model-facing tool that made it.
+_TOOL_BY_RECORDED_NAME: dict[str, TargetToolName] = {
+    recorded: tool for tool, recorded in tools.RECORDED_NAMES.items()
+}
+
 
 class ModelCallTraceEntry(BaseModel):
     """One model request. A failed or rejected one shows only its error code:
@@ -205,7 +211,7 @@ class ToolCallTraceEntry(BaseModel):
     def of(cls, call: ToolCall) -> Self:
         return cls(
             sequence_no=call.sequence_no,
-            tool=MODEL_TOOL_NAMES[call.tool_name],
+            tool=_TOOL_BY_RECORDED_NAME[call.tool_name],
             status=call.status,
             policy=call.policy_decision,
             error_code=None if call.error is None else call.error["code"],

@@ -12,23 +12,19 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from app.agent.executor import tool_error
-from app.agent.observations import REJECTION_CODES, observe, serialize
+from app.agent.tools import REJECTION_CODES, observe, serialize
 from app.models import DesiredState, GoalType, UserStatus
 from app.schemas.agent import (
-    AssignLicenceInput,
     AssignmentAttemptObservation,
     AssignmentSnapshot,
-    GetLicenceInput,
-    GetUserInput,
     LicenceCapacityObservation,
     LicenceSnapshot,
-    ListUserAssignmentsInput,
     ModelObservation,
     ResolvedAssignmentGoal,
     TargetAssignmentsObservation,
+    TargetToolName,
     TargetUserObservation,
     ToolError,
-    ToolInput,
     ToolOutput,
     UserAssignmentsSnapshot,
     UserSnapshot,
@@ -40,6 +36,7 @@ from app.services.errors import (
     UserInactive,
     UserNotFound,
 )
+from support import ASSIGN, ASSIGNMENTS, CAPACITY, USER
 
 ADA = 48213
 FIGMA = 97531
@@ -56,7 +53,6 @@ GOAL = ResolvedAssignmentGoal(
     extracted_user_email="ada@example.com",
     extracted_product="Figma",
 )
-ASSIGN = AssignLicenceInput(user_id=ADA, licence_id=FIGMA)
 OBSERVATION_TYPES: list[type[BaseModel]] = list(get_args(ModelObservation))
 
 
@@ -80,9 +76,9 @@ def assert_id_free(text: str) -> None:
 
 # --- each read tool -------------------------------------------------------------
 
-READS: dict[str, tuple[ToolInput, ToolOutput, ModelObservation, str]] = {
+READS: dict[str, tuple[TargetToolName, ToolOutput, ModelObservation, str]] = {
     "user": (
-        GetUserInput(user_id=ADA),
+        USER,
         UserSnapshot(
             user_id=ADA, email="ada@example.com", name="Ada", status=UserStatus.ACTIVE
         ),
@@ -90,7 +86,7 @@ READS: dict[str, tuple[ToolInput, ToolOutput, ModelObservation, str]] = {
         '{"status":"active"}',
     ),
     "capacity": (
-        GetLicenceInput(licence_id=FIGMA),
+        CAPACITY,
         LicenceSnapshot(
             licence_id=FIGMA,
             product="Figma",
@@ -102,7 +98,7 @@ READS: dict[str, tuple[ToolInput, ToolOutput, ModelObservation, str]] = {
         '{"seats_active":2,"seats_available":1,"seats_total":3}',
     ),
     "assignments": (
-        ListUserAssignmentsInput(user_id=ADA),
+        ASSIGNMENTS,
         UserAssignmentsSnapshot(user_id=ADA, assignments=[assignment()]),
         TargetAssignmentsObservation(holds_active_seat=True),
         '{"holds_active_seat":true}',
@@ -111,12 +107,12 @@ READS: dict[str, tuple[ToolInput, ToolOutput, ModelObservation, str]] = {
 
 
 @pytest.mark.parametrize(
-    ("args", "internal", "expected", "text"), READS.values(), ids=READS
+    ("tool", "internal", "expected", "text"), READS.values(), ids=READS
 )
 def test_each_read_result_becomes_its_id_free_observation(
-    args: ToolInput, internal: ToolOutput, expected: ModelObservation, text: str
+    tool: TargetToolName, internal: ToolOutput, expected: ModelObservation, text: str
 ) -> None:
-    observation = observe(GOAL, args, internal)
+    observation = observe(tool, GOAL, internal)
 
     assert observation == expected
     assert serialize(expected) == text
@@ -140,7 +136,7 @@ def test_only_an_active_seat_of_the_target_licence_counts_as_held(
 ) -> None:
     listing = UserAssignmentsSnapshot(user_id=ADA, assignments=assignments)
 
-    assert observe(GOAL, ListUserAssignmentsInput(user_id=ADA), listing) == (
+    assert observe(ASSIGNMENTS, GOAL, listing) == (
         TargetAssignmentsObservation(holds_active_seat=holds)
     )
 
@@ -149,7 +145,7 @@ def test_only_an_active_seat_of_the_target_licence_counts_as_held(
 
 
 def test_a_successful_assignment_is_observed_as_assigned() -> None:
-    observation = observe(GOAL, ASSIGN, assignment())
+    observation = observe(ASSIGN, GOAL, assignment())
 
     assert observation == AssignmentAttemptObservation(
         outcome="assigned", reason_code=None
@@ -173,7 +169,7 @@ def test_a_domain_rejection_is_observed_by_code_never_by_message(
     internal = tool_error(error, "assign_licence")
     assert any(row_id in internal.message for row_id in IDS)  # ids in the message
 
-    observation = observe(GOAL, ASSIGN, internal)
+    observation = observe(ASSIGN, GOAL, internal)
 
     assert observation == AssignmentAttemptObservation.model_validate(
         {"outcome": "rejected", "reason_code": code}
@@ -193,19 +189,15 @@ def test_the_rejections_a_model_may_see_are_exactly_the_domain_rules() -> None:
 
 
 @pytest.mark.parametrize(
-    ("args", "error"),
+    ("tool", "error"),
     [
         (ASSIGN, tool_error(RuntimeError(f"SQL mentions {ADA}"), "assign_licence")),
         (ASSIGN, tool_error(UserNotFound(ADA), "assign_licence")),
         (ASSIGN, tool_error(LicenceNotFound(FIGMA), "assign_licence")),
-        (
-            ASSIGN,
-            ToolError(code="goal_scope_violation", message="x", error_type=None),
-        ),
-        (GetUserInput(user_id=ADA), tool_error(UserNotFound(ADA), "get_user")),
+        (USER, tool_error(UserNotFound(ADA), "get_user")),
         # A blocking code from anything but the assignment is not a rejection.
         (
-            GetLicenceInput(licence_id=FIGMA),
+            CAPACITY,
             ToolError(code="no_seats_available", message="x", error_type=None),
         ),
     ],
@@ -213,13 +205,14 @@ def test_the_rejections_a_model_may_see_are_exactly_the_domain_rules() -> None:
         "unexpected",
         "user-not-found",
         "licence-not-found",
-        "scope",
         "read-failure",
         "read-with-blocking-code",
     ],
 )
-def test_any_other_failure_is_shown_nothing(args: Any, error: ToolError) -> None:
-    assert observe(GOAL, args, error) is None
+def test_any_other_failure_is_shown_nothing(
+    tool: TargetToolName, error: ToolError
+) -> None:
+    assert observe(tool, GOAL, error) is None
 
 
 # --- the DTOs themselves ----------------------------------------------------------

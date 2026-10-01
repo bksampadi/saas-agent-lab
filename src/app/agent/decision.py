@@ -1,8 +1,8 @@
 """The decision stage's contract, whichever model or planner runs it.
 
 After resolution, a model chooses which of four goal-bound tools to call
-(app.agent.decision_tools), in what order, and when to conclude. This module
-holds what the application fixes around that choice:
+(app.agent.tools), in what order, and when to conclude. This module holds
+what the application fixes around that choice:
 
 - the limits, enforced by application code, not by the prompt;
 - what the model is told (decision_context): the persisted goal's semantic
@@ -26,9 +26,9 @@ from app.schemas.agent import (
 # Model requests in one decision stage, retries included. Checked before
 # each request by the executor's model-call recorder (before_request).
 MAX_DECISION_MODEL_REQUESTS = 6
-# Read tool calls, and mutation attempts, in one run. Checked by
-# AgentExecutor.call_decision_tool before any business transaction opens. A
-# rejected mutation still counts: it was an attempt.
+# Read tool calls, and mutation attempts, in one run. Checked when
+# AgentExecutor.call_tool admits a call, before any business transaction
+# opens. A rejected mutation still counts: it was an attempt.
 MAX_DECISION_READ_CALLS = 6
 MAX_DECISION_MUTATION_CALLS = 1
 
@@ -40,38 +40,15 @@ class DecisionLimit(StrEnum):
 
 
 class DecisionStopped(Exception):
-    """The decision loop must stop at once. Raised through the planner and
-    its model loop, never shown to the model as an observation."""
-
-
-class DecisionLimitExceeded(DecisionStopped):
-    """A decision-stage limit would be exceeded. Nothing over the limit ran:
-    no model request, or no business transaction. The executor ends the run
-    FAILED (step_limit)."""
-
-    def __init__(self, limit: DecisionLimit, maximum: int) -> None:
-        super().__init__(f"Decision limit reached: at most {maximum} {limit.value}.")
-        self.limit = limit
-        self.maximum = maximum
-
-
-class RunEndedDuringDecision(DecisionStopped):
-    """A tool call ended the run in a way the model is not shown: a failure
-    it is not shown, or a mutation policy denied."""
-
-    def __init__(self, run_id: int, status: AgentRunStatus) -> None:
-        super().__init__(f"Agent run {run_id} ended {status} during a tool call.")
-        self.run_id = run_id
-        self.status = status
-
-
-class RunAwaitingApproval(DecisionStopped):
-    """Policy held the model's mutation for a person's approval, unrun, and
-    paused the run. The model is not asked anything more: nothing it says
-    could change the pause."""
+    """The application ended or paused the run during its decision loop: a
+    limit was reached (FAILED, step_limit), policy denied or held the
+    mutation (BLOCKED, or AWAITING_APPROVAL), or a tool call failed in a way
+    the model is not shown (FAILED, tool_failed). The run's status says
+    which. The loop must stop at once: this is raised through the planner
+    and its model loop, never shown to the model as an observation."""
 
     def __init__(self, run_id: int) -> None:
-        super().__init__(f"Agent run {run_id} is awaiting approval.")
+        super().__init__(f"Agent run {run_id} was stopped during its decision.")
         self.run_id = run_id
 
 

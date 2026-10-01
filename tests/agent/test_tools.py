@@ -4,26 +4,15 @@ Called by a scripted model through the executor, and checked in the
 persisted ToolCall.result.
 """
 
-from dataclasses import fields
 from datetime import UTC, datetime
 from typing import Any
 
 import pytest
-from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.agent import tools
 from app.agent.executor import AgentExecutor
 from app.models import Assignment, AuditEvent, Licence, ToolCall, User
-from app.schemas.agent import (
-    AssignLicenceInput,
-    GetLicenceInput,
-    GetUserInput,
-    ListUserAssignmentsInput,
-    ToolInput,
-)
-from app.schemas.assignment import ID_MAX
 from support import (
     ASSIGN,
     ASSIGNMENTS,
@@ -181,59 +170,3 @@ def test_read_tools_change_nothing_and_write_no_audit_events(
     assert all(s.startswith("SELECT") for s in business)
     assert count(session_factory, AuditEvent) == 0
     assert count(session_factory, Assignment) == 0
-
-
-@pytest.mark.parametrize(
-    "build",
-    [
-        lambda: GetUserInput.model_validate({"user_id": 1, "email": "x@example.com"}),
-        lambda: AssignLicenceInput.model_validate(
-            {"user_id": 1, "licence_id": 1, "actor": "admin@example.com"}
-        ),
-        lambda: GetUserInput(user_id=0),
-        lambda: GetLicenceInput(licence_id=-1),
-        lambda: AssignLicenceInput(user_id=1, licence_id=ID_MAX + 1),
-    ],
-    ids=["extra-field", "actor-field", "zero-id", "negative-id", "id-too-large"],
-)
-def test_tool_inputs_reject_unknown_fields_and_invalid_ids(build: Any) -> None:
-    with pytest.raises(ValidationError):
-        build()
-
-
-def test_only_assign_licence_mutates() -> None:
-    names = [tool_input.tool_name for tool_input in tools.TOOL_INPUTS]
-
-    assert sorted(names) == [
-        "assign_licence",
-        "get_licence",
-        "get_user",
-        "list_user_assignments",
-    ]
-    assert tools.MUTATING_TOOL_NAMES == {"assign_licence"}
-
-
-def test_tools_are_given_services_and_an_actor_never_a_session() -> None:
-    assert [f.name for f in fields(tools.ToolContext)] == [
-        "users",
-        "licences",
-        "assignments",
-        "actor",
-    ]
-
-
-def test_every_tool_input_names_its_targets() -> None:
-    # target_ids is what the goal-scope check compares against the goal.
-    examples: list[ToolInput] = [
-        GetUserInput(user_id=7),
-        GetLicenceInput(licence_id=8),
-        ListUserAssignmentsInput(user_id=7),
-        AssignLicenceInput(user_id=7, licence_id=8),
-    ]
-
-    assert [tools.target_ids(args) for args in examples] == [
-        (7, None),
-        (None, 8),
-        (7, None),
-        (7, 8),
-    ]

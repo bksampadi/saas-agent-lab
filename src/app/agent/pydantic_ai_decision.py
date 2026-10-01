@@ -10,9 +10,9 @@ limit is checked, and every request is recorded as soon as it has an
 outcome (app.agent.model_requests). Tool calls run one at a time, in the
 order the model asked for them.
 
-A limit reached, or a run ended by a tool call, stops the loop at once
-(DecisionStopped passes through unchanged); it is never turned into an
-observation for the model to answer.
+A run the application ends or pauses (a limit, policy, a failure the model
+is not shown) stops the loop at once: DecisionStopped passes through
+unchanged, and is never turned into an observation for the model to answer.
 """
 
 import time
@@ -25,16 +25,15 @@ from pydantic_ai.messages import ModelResponse, ToolCallPart
 from pydantic_ai.models import Model
 from pydantic_ai.output import ToolOutput
 from pydantic_ai.settings import ModelSettings
-from pydantic_ai.usage import UsageLimits
 
-from app.agent.decision import MAX_DECISION_MODEL_REQUESTS, DecisionStopped
+from app.agent.decision import DecisionStopped
 from app.agent.model_requests import (
     CheckAndRecordModelRequests,
     InvalidOutput,
     as_planner_error,
     describe_validation_error,
 )
-from app.agent.planner import DecisionModelCallRecorder, TargetTools
+from app.agent.planner import CallTool, DecisionModelCallRecorder
 from app.schemas.agent import (
     CannotProceed,
     DecisionContext,
@@ -64,28 +63,28 @@ TARGET_TOOL_NAMES: frozenset[str] = frozenset(get_args(TargetToolName))
 
 # The model-facing tools. Each takes only PydanticAI's run context, which is
 # not part of the tool's schema, so the model supplies nothing. The context
-# carries the run's TargetTools, already bound to its goal.
+# carries the run's CallTool, which binds the run's goal in.
 
 
-def get_target_user(ctx: RunContext[TargetTools]) -> str:
+def get_target_user(ctx: RunContext[CallTool]) -> str:
     """The user's account status."""
-    return ctx.deps.get_target_user()
+    return ctx.deps("get_target_user")
 
 
-def get_target_licence_capacity(ctx: RunContext[TargetTools]) -> str:
+def get_target_licence_capacity(ctx: RunContext[CallTool]) -> str:
     """The product's seats: total, in use and available."""
-    return ctx.deps.get_target_licence_capacity()
+    return ctx.deps("get_target_licence_capacity")
 
 
-def list_target_user_assignments(ctx: RunContext[TargetTools]) -> str:
+def list_target_user_assignments(ctx: RunContext[CallTool]) -> str:
     """Whether the user already holds an active seat of the product."""
-    return ctx.deps.list_target_user_assignments()
+    return ctx.deps("list_target_user_assignments")
 
 
-def assign_target_licence(ctx: RunContext[TargetTools]) -> str:
+def assign_target_licence(ctx: RunContext[CallTool]) -> str:
     """Try to give the user a seat of the product: assigned, or rejected with
     a reason_code."""
-    return ctx.deps.assign_target_licence()
+    return ctx.deps("assign_target_licence")
 
 
 TARGET_TOOLS = (
@@ -156,7 +155,7 @@ class PydanticAIDecisionPlanner:
         self._clock = clock
         self._agent = Agent(
             model,
-            deps_type=TargetTools,
+            deps_type=CallTool,
             output_type=[
                 ToolOutput(output_type, name=name)
                 for name, output_type in PROPOSAL_TOOLS.items()
@@ -178,7 +177,7 @@ class PydanticAIDecisionPlanner:
     def decide(
         self,
         context: DecisionContext,
-        tools: TargetTools,
+        call_tool: CallTool,
         calls: DecisionModelCallRecorder,
     ) -> DecisionProposal:
         checker = CheckAndRecordModelRequests(
@@ -191,11 +190,8 @@ class PydanticAIDecisionPlanner:
             result = self._agent.run_sync(
                 context.prompt,
                 instructions=context.instructions,
-                deps=tools,
+                deps=call_tool,
                 capabilities=[checker],
-                # Defence in depth only: set one above the application's
-                # limit, which before_request enforces first.
-                usage_limits=UsageLimits(request_limit=MAX_DECISION_MODEL_REQUESTS + 1),
             )
         except DecisionStopped:
             raise

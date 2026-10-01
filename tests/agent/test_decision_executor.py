@@ -17,13 +17,13 @@ from sqlalchemy import Engine, event, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
-from app.agent.decision import DecisionLimitExceeded
+from app.agent.decision import DecisionStopped
 from app.agent.executor import AgentExecutor, RunNotExecutable
 from app.agent.planner import (
+    CallTool,
     DecisionModelCallRecorder,
     ModelCallRecorder,
     PlannerError,
-    TargetTools,
 )
 from app.agent.pydantic_ai_decision import PydanticAIDecisionPlanner
 from app.core.database import create_db_engine
@@ -90,7 +90,7 @@ def record(output: dict[str, Any]) -> ModelCallRecord:
 
 def answer(proposal: DecisionProposal) -> Act:
     def act(
-        context: DecisionContext, tools: TargetTools, calls: DecisionModelCallRecorder
+        context: DecisionContext, call_tool: CallTool, calls: DecisionModelCallRecorder
     ) -> DecisionProposal:
         calls.before_request()
         calls.record(record(proposal.model_dump(mode="json")))
@@ -202,35 +202,14 @@ def test_an_unexpected_planner_exception_fails_the_run_without_its_message(
     )
 
 
-def test_the_request_limit_holds_even_for_a_planner_that_skips_the_check(
-    executor: AgentExecutor, session_factory: Sessions, seed: tuple[int, int]
-) -> None:
-    made: list[int] = []
-
-    def act(
-        context: DecisionContext, tools: TargetTools, calls: DecisionModelCallRecorder
-    ) -> DecisionProposal:
-        while True:  # never calls before_request
-            calls.record(record({"kind": "tool_calls", "tool_names": []}))
-            made.append(1)
-
-    run_id = resolved_run(executor)
-    executor.decide(run_id, FakeDecisionPlanner(act))
-
-    run = get_run(session_factory, run_id)
-    assert (run.status, run.outcome_reason) == (S.FAILED, R.STEP_LIMIT)
-    # The request over the limit happened, so it is recorded; then it stops.
-    assert len(made) == 6
-    assert rows(session_factory, ModelCall) == 7
-
-
 def test_before_request_refuses_the_request_over_the_limit(
     executor: AgentExecutor, session_factory: Sessions, seed: tuple[int, int]
 ) -> None:
+    # A real planner calls before_request before every request.
     allowed: list[int] = []
 
     def act(
-        context: DecisionContext, tools: TargetTools, calls: DecisionModelCallRecorder
+        context: DecisionContext, call_tool: CallTool, calls: DecisionModelCallRecorder
     ) -> DecisionProposal:
         while True:
             calls.before_request()
@@ -241,25 +220,29 @@ def test_before_request_refuses_the_request_over_the_limit(
     executor.decide(run_id, FakeDecisionPlanner(act))
 
     assert len(allowed) == rows(session_factory, ModelCall) == 6
-    assert get_run(session_factory, run_id).outcome_detail == {
-        "limit": "model_requests",
-        "maximum": 6,
-    }
+    run = get_run(session_factory, run_id)
+    assert (run.status, run.outcome_reason, run.outcome_detail) == (
+        S.FAILED,
+        R.STEP_LIMIT,
+        {"limit": "model_requests", "maximum": 6},
+    )
 
 
 def test_a_limit_is_an_exception_through_the_planner_not_an_observation(
-    executor: AgentExecutor, seed: tuple[int, int]
+    executor: AgentExecutor, session_factory: Sessions, seed: tuple[int, int]
 ) -> None:
-    raised: list[type[BaseException]] = []
+    ended: list[tuple[AgentRunStatus, OutcomeReason | None]] = []
 
     def act(
-        context: DecisionContext, tools: TargetTools, calls: DecisionModelCallRecorder
+        context: DecisionContext, call_tool: CallTool, calls: DecisionModelCallRecorder
     ) -> DecisionProposal:
-        tools.assign_target_licence()
+        call_tool(ASSIGN)
         try:
-            tools.assign_target_licence()
-        except DecisionLimitExceeded as error:
-            raised.append(type(error))
+            call_tool(ASSIGN)
+        except DecisionStopped:
+            # The run has already ended where the limit was counted.
+            run = get_run(session_factory, run_id)
+            ended.append((run.status, run.outcome_reason))
             raise
         return GoalReached()
 
@@ -267,7 +250,7 @@ def test_a_limit_is_an_exception_through_the_planner_not_an_observation(
     status = executor.decide(run_id, FakeDecisionPlanner(act))
 
     assert status is S.FAILED
-    assert raised == [DecisionLimitExceeded]
+    assert ended == [(S.FAILED, R.STEP_LIMIT)]
 
 
 # --- the whole run ---------------------------------------------------------------

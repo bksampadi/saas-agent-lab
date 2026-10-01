@@ -17,15 +17,15 @@ from pydantic_ai.messages import ModelResponse
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session, sessionmaker
 
-import app.agent.executor as executor_module
 from app.agent import policy, tools
-from app.agent.decision_tools import GoalBoundTools
-from app.agent.executor import AgentExecutor, RunNotExecutable, ToolCallOutcome
+from app.agent.executor import AgentExecutor, RunNotExecutable
 from app.models import (
     AgentRun,
     AgentRunStatus,
     Assignment,
     AuditEvent,
+    DesiredState,
+    GoalType,
     Licence,
     OutcomeReason,
     PolicyDecision,
@@ -35,13 +35,9 @@ from app.models import (
 )
 from app.repositories.tool_calls import ToolCallRepository
 from app.schemas.agent import (
-    AssignLicenceInput,
     EnsureAssignmentIntent,
-    GetLicenceInput,
-    GetUserInput,
-    ListUserAssignmentsInput,
-    ToolError,
-    ToolInput,
+    ResolvedAssignmentGoal,
+    TargetToolName,
 )
 from app.services.licences import LicenceService
 from support import (
@@ -121,16 +117,30 @@ def mutations(sessions: Sessions) -> tuple[int, int]:
 @pytest.fixture
 def business(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """The tool of every call that entered a business transaction, in order.
-    tools.run_tool is called only inside that transaction."""
+    tools.run is called only inside that transaction."""
     entered: list[str] = []
-    real = tools.run_tool
+    real = tools.run
 
-    def spy(context: tools.ToolContext, args: ToolInput) -> Any:
-        entered.append(args.tool_name)
-        return real(context, args)
+    def spy(tool: TargetToolName, goal: ResolvedAssignmentGoal, **services: Any) -> Any:
+        entered.append(tool)
+        return real(tool, goal, **services)
 
-    monkeypatch.setattr(tools, "run_tool", spy)
+    monkeypatch.setattr(tools, "run", spy)
     return entered
+
+
+@pytest.fixture
+def requested(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """The tool of every call the planner asked the application to run."""
+    asked: list[str] = []
+    real = AgentExecutor.call_tool
+
+    def spy(self: AgentExecutor, run_id: int, tool: TargetToolName) -> str:
+        asked.append(tool)
+        return real(self, run_id, tool)
+
+    monkeypatch.setattr(AgentExecutor, "call_tool", spy)
+    return asked
 
 
 @pytest.fixture
@@ -139,15 +149,28 @@ def evaluations(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     evaluated: list[str] = []
     real = policy.evaluate
 
-    def spy(args: ToolInput, licences: LicenceService) -> PolicyDecision | None:
-        evaluated.append(args.tool_name)
-        return real(args, licences)
+    def spy(
+        tool: TargetToolName, goal: ResolvedAssignmentGoal, licences: LicenceService
+    ) -> PolicyDecision | None:
+        evaluated.append(tool)
+        return real(tool, goal, licences)
 
     monkeypatch.setattr(policy, "evaluate", spy)
     return evaluated
 
 
 # --- the policy itself --------------------------------------------------------
+
+
+def goal_for(licence_id: int) -> ResolvedAssignmentGoal:
+    return ResolvedAssignmentGoal(
+        goal_type=GoalType.ENSURE_ASSIGNMENT,
+        desired_state=DesiredState.ASSIGNED,
+        user_id=1,
+        licence_id=licence_id,
+        extracted_user_email="ada@example.com",
+        extracted_product="Figma",
+    )
 
 
 @pytest.mark.parametrize("agent_policy", list(PolicyDecision))
@@ -158,55 +181,17 @@ def test_an_assignment_is_decided_by_its_licence_policy(
     session.add(licence)
     session.flush()
 
-    decision = policy.evaluate(
-        AssignLicenceInput(user_id=1, licence_id=licence.id), LicenceService(session)
-    )
+    decision = policy.evaluate(ASSIGN, goal_for(licence.id), LicenceService(session))
 
     assert decision is agent_policy
 
 
-@pytest.mark.parametrize(
-    "args",
-    [
-        GetUserInput(user_id=1),
-        GetLicenceInput(licence_id=1),
-        ListUserAssignmentsInput(user_id=1),
-    ],
-    ids=lambda args: args.tool_name,
-)
-def test_reads_are_not_governed_by_policy(session: Session, args: ToolInput) -> None:
+@pytest.mark.parametrize("tool", [USER, CAPACITY, ASSIGNMENTS])
+def test_reads_are_not_governed_by_policy(
+    session: Session, tool: TargetToolName
+) -> None:
     # Nothing is read for them either: licence 1 does not exist.
-    assert policy.evaluate(args, LicenceService(session)) is None
-
-
-def test_assign_licence_is_the_only_mutation_policy_governs_today() -> None:
-    # A tripwire: a new mutating tool needs its own policy case and tests.
-    assert tools.MUTATING_TOOL_NAMES == {AssignLicenceInput.tool_name}
-
-
-def test_an_empty_outcome_can_only_mean_a_call_held_for_approval() -> None:
-    held = ToolCallOutcome(
-        tool_call_id=1,
-        sequence_no=1,
-        output=None,
-        error=None,
-        run_status=S.AWAITING_APPROVAL,
-    )
-    assert held.run_status is S.AWAITING_APPROVAL
-
-    error = ToolError(code="policy_denied", message="m", error_type=None)
-    for output_error, run_status in [
-        ((None, None), S.EXECUTING),  # not an empty success
-        ((None, error), S.AWAITING_APPROVAL),  # held calls carry no error
-    ]:
-        with pytest.raises(ValueError, match="held for approval"):
-            ToolCallOutcome(
-                tool_call_id=1,
-                sequence_no=1,
-                output=output_error[0],
-                error=output_error[1],
-                run_status=run_status,
-            )
+    assert policy.evaluate(tool, goal_for(1), LicenceService(session)) is None
 
 
 # --- each decision, recorded with its call ---------------------------------------
@@ -228,7 +213,7 @@ def test_an_allowed_assignment_runs_as_before_and_records_the_decision(
         ("get_licence", None),
         ("assign_licence", ALLOW),
     ]
-    assert business == ["list_user_assignments", "get_licence", "assign_licence"]
+    assert business == [ASSIGNMENTS, CAPACITY, ASSIGN]
     assert mutations(session_factory) == (1, 1)
     with session_factory() as session:
         event = session.scalars(select(AuditEvent)).one()
@@ -256,7 +241,7 @@ def test_a_denied_assignment_never_runs_and_blocks_the_run(
     assert (denied.result, denied.observation) == (None, None)
     assert denied.completed_at is not None
     # Zero mutation: the call never entered a business transaction.
-    assert "assign_licence" not in business
+    assert ASSIGN not in business
     assert mutations(session_factory) == (0, 0)
     # Ended at admission, not verified.
     assert run.outcome_detail is not None and "satisfied" not in run.outcome_detail
@@ -290,7 +275,7 @@ def test_a_held_assignment_never_runs_and_pauses_the_run(
         None,
         None,
     )
-    assert "assign_licence" not in business
+    assert ASSIGN not in business
     assert mutations(session_factory) == (0, 0)
 
 
@@ -304,18 +289,18 @@ def test_a_denied_or_held_mutation_opens_no_business_transaction(
 ) -> None:
     seed(session_factory, agent_policy)
     run_id = resolved_run(executor)
-    contexts: list[str] = []
+    entered: list[str] = []
 
-    def no_business(session: Session, actor: str) -> Any:
-        contexts.append(actor)  # the first thing a business transaction does
+    def no_business(tool: TargetToolName, *_: Any, **__: Any) -> Any:
+        entered.append(tool)  # called only inside a business transaction
         raise AssertionError("a business transaction was opened")
 
-    monkeypatch.setattr(executor_module, "_tool_context", no_business)
+    monkeypatch.setattr(tools, "run", no_business)
     first = len(statements)
 
     status = executor.decide(run_id, Script(call(ASSIGN), GOAL_REACHED).planner())
 
-    assert contexts == []
+    assert entered == []
     sent = " ".join(statements[first:])
     # Only the log tables and the licence policy were touched.
     assert "assignments" not in sent and "audit_events" not in sent
@@ -342,13 +327,12 @@ def test_a_paused_run_refuses_every_further_step(
     calls_before = len(tool_calls(session_factory, run_id))
 
     intent = EnsureAssignmentIntent(user_email="ada@example.com", product="Figma")
-    assign = AssignLicenceInput(user_id=ADA, licence_id=FIGMA)
     steps: list[Callable[[], object]] = [
         lambda: executor.extract_intent(run_id, FixedIntent(intent)),
         lambda: executor.resolve_run(run_id),
         lambda: executor.decide(run_id, Script(GOAL_REACHED).planner()),
-        lambda: executor.call_decision_tool(run_id, GetUserInput(user_id=ADA)),
-        lambda: executor.call_decision_tool(run_id, assign),
+        lambda: executor.call_tool(run_id, USER),
+        lambda: executor.call_tool(run_id, ASSIGN),
     ]
     for step in steps:
         with pytest.raises(RunNotExecutable):
@@ -390,7 +374,7 @@ def test_a_mutation_over_the_limit_is_refused_before_policy_is_evaluated(
     assert first.error is not None and second.error is not None
     assert (first.error["code"], first.policy_decision) == ("no_seats_available", ALLOW)
     assert (second.error["code"], second.policy_decision) == ("step_limit", None)
-    assert evaluations == ["assign_licence"]  # the refused call never was
+    assert evaluations == [ASSIGN]  # the refused call never was
 
 
 def test_policy_is_read_when_the_call_is_admitted_not_at_resolution(
@@ -447,7 +431,7 @@ def test_the_model_is_asked_nothing_more_after_a_denial_or_hold(
         agent_policy,
         None,
     )
-    assert business == ["list_user_assignments"]
+    assert business == [ASSIGNMENTS]
     assert mutations(session_factory) == (0, 0)
 
 
@@ -456,31 +440,18 @@ def test_a_later_tool_in_the_same_response_never_runs(
     executor: AgentExecutor,
     session_factory: Sessions,
     business: list[str],
-    monkeypatch: pytest.MonkeyPatch,
+    requested: list[str],
     agent_policy: PolicyDecision,
 ) -> None:
     seed(session_factory, agent_policy)
-    entered: list[str] = []
-    real_target_user = GoalBoundTools.get_target_user
-    real_get_user = tools.get_user
-
-    def target_user_spy(self: GoalBoundTools) -> str:
-        entered.append("get_target_user")  # the model-facing tool's body
-        return real_target_user(self)
-
-    def get_user_spy(context: tools.ToolContext, args: GetUserInput) -> Any:
-        entered.append("get_user")  # the application tool's body
-        return real_get_user(context, args)
-
-    monkeypatch.setattr(GoalBoundTools, "get_target_user", target_user_spy)
-    monkeypatch.setattr(tools, "get_user", get_user_spy)
     # One response asks for the mutation, then a read.
     script = Script(call(ASSIGN, USER), GOAL_REACHED)
     run_id = resolved_run(executor)
 
     executor.decide(run_id, script.planner())
 
-    assert entered == []
+    # The read never reached the application, let alone a business transaction.
+    assert requested == [ASSIGN]
     assert business == []
     assert [c.tool_name for c in tool_calls(session_factory, run_id)] == [
         "assign_licence"
@@ -493,24 +464,17 @@ def test_a_later_tool_in_the_same_response_never_runs(
 def test_the_same_response_still_runs_both_tools_when_policy_allows(
     executor: AgentExecutor,
     session_factory: Sessions,
-    monkeypatch: pytest.MonkeyPatch,
+    business: list[str],
+    requested: list[str],
 ) -> None:
     # The control for the test above: the spies do see a later tool when
     # nothing stops the loop.
     seed(session_factory, ALLOW)
-    entered: list[str] = []
-    real_target_user = GoalBoundTools.get_target_user
-
-    def target_user_spy(self: GoalBoundTools) -> str:
-        entered.append("get_target_user")
-        return real_target_user(self)
-
-    monkeypatch.setattr(GoalBoundTools, "get_target_user", target_user_spy)
     script = Script(call(ASSIGN, USER), GOAL_REACHED)
     run_id = resolved_run(executor)
 
     assert executor.decide(run_id, script.planner()) is S.COMPLETED
-    assert entered == ["get_target_user"]
+    assert requested == business == [ASSIGN, USER]
     assert [c.tool_name for c in tool_calls(session_factory, run_id)] == [
         "assign_licence",
         "get_user",

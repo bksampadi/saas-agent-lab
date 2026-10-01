@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session, sessionmaker
 import app.agent.executor as executor_module
 from app.agent import tools
 from app.agent.executor import AgentExecutor, RunNotExecutable, UnfinishedToolCall
-from app.agent.planner import DecisionModelCallRecorder, TargetTools
+from app.agent.planner import CallTool, DecisionModelCallRecorder
 from app.models import (
     AgentRun,
     AgentRunStatus,
@@ -38,13 +38,15 @@ from app.repositories.assignments import AssignmentRepository
 from app.repositories.audit_events import AuditEventRepository
 from app.repositories.tool_calls import ToolCallRepository
 from app.schemas.agent import (
-    AssignLicenceInput,
     AssignmentSnapshot,
     DecisionContext,
     DecisionProposal,
     GoalReached,
     LicenceSnapshot,
+    ResolvedAssignmentGoal,
+    TargetToolName,
     ToolError,
+    ToolOutput,
     UserAssignmentsSnapshot,
     UserSnapshot,
 )
@@ -147,9 +149,9 @@ def decided(
 
 
 def assign_then_conclude(
-    context: DecisionContext, target: TargetTools, calls: DecisionModelCallRecorder
+    context: DecisionContext, call_tool: CallTool, calls: DecisionModelCallRecorder
 ) -> DecisionProposal:
-    target.assign_target_licence()
+    call_tool(ASSIGN)
     return GoalReached()
 
 
@@ -157,7 +159,7 @@ class Crash(BaseException):
     """Stands in for the process dying: not an Exception, so nothing catches it."""
 
 
-def crash(*_: Any) -> None:
+def crash(*_: Any, **__: Any) -> None:
     raise Crash
 
 
@@ -507,19 +509,24 @@ def test_a_tool_claiming_success_without_writing_cannot_complete_the_run(
     seed: Seed,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def lying_assign(
-        context: tools.ToolContext, args: AssignLicenceInput
-    ) -> AssignmentSnapshot:
+    real_run = tools.run
+
+    def lying_run(
+        tool: TargetToolName, goal: ResolvedAssignmentGoal, **services: Any
+    ) -> ToolOutput:
+        if tool != ASSIGN:
+            return real_run(tool, goal, **services)
+        # Claims the assignment without making it.
         return AssignmentSnapshot(
             assignment_id=999,
-            user_id=args.user_id,
-            licence_id=args.licence_id,
+            user_id=goal.user_id,
+            licence_id=goal.licence_id,
             active=True,
             assigned_at=datetime.now(UTC),
             revoked_at=None,
         )
 
-    monkeypatch.setattr(tools, "assign_licence", lying_assign)
+    monkeypatch.setattr(tools, "run", lying_run)
 
     run_id = decided(executor, call(ASSIGN), GOAL_REACHED)
 
@@ -654,7 +661,7 @@ def test_a_crash_after_a_call_starts_leaves_it_started_and_changes_nothing(
 ) -> None:
     run_id = resolved_run(executor)
     with monkeypatch.context() as patch:
-        patch.setattr(tools, "run_tool", crash)
+        patch.setattr(tools, "run", crash)
         with pytest.raises(Crash):
             executor.decide(run_id, FakeDecisionPlanner(assign_then_conclude))
 
@@ -683,14 +690,14 @@ def test_a_planner_that_carries_on_after_a_crashed_call_cannot_call_or_conclude(
     refused: list[str] = []
 
     def carry_on(
-        context: DecisionContext, target: TargetTools, calls: DecisionModelCallRecorder
+        context: DecisionContext, call_tool: CallTool, calls: DecisionModelCallRecorder
     ) -> DecisionProposal:
         with monkeypatch.context() as patch:
-            patch.setattr(tools, "run_tool", crash)
+            patch.setattr(tools, "run", crash)
             with contextlib.suppress(Crash):  # the planner swallows the crash
-                target.assign_target_licence()
+                call_tool(ASSIGN)
         with pytest.raises(UnfinishedToolCall):
-            target.get_target_user()
+            call_tool(USER)
         refused.append("tool call")
         return GoalReached()
 

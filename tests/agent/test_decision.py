@@ -446,16 +446,18 @@ def test_a_claimed_block_is_checked_against_current_state_not_the_observation(
 # --- limits ---------------------------------------------------------------------
 
 
-def spy(monkeypatch: pytest.MonkeyPatch, name: str) -> list[int]:
-    """Count calls of tools.<name>, the business operation behind a tool."""
+def spy(monkeypatch: pytest.MonkeyPatch, tool: str) -> list[int]:
+    """Count the calls of ``tool`` that reached a business transaction:
+    tools.run is called only inside one."""
     calls: list[int] = []
-    real = getattr(tools, name)
+    real = tools.run
 
-    def counting(*args: Any) -> Any:
-        calls.append(1)
-        return real(*args)
+    def counting(called: Any, goal: Any, **services: Any) -> Any:
+        if called == tool:
+            calls.append(1)
+        return real(called, goal, **services)
 
-    monkeypatch.setattr(tools, name, counting)
+    monkeypatch.setattr(tools, "run", counting)
     return calls
 
 
@@ -471,7 +473,7 @@ def test_a_second_mutation_never_reaches_the_business_transaction(
     steps: tuple[Step, ...],
 ) -> None:
     seed(session_factory)
-    assigned = spy(monkeypatch, "assign_licence")
+    assigned = spy(monkeypatch, ASSIGN)
     script = Script(*steps, GOAL_REACHED)
 
     run_id, _ = decide(executor, script)
@@ -505,7 +507,7 @@ def test_a_rejected_mutation_attempt_still_uses_the_mutation_budget(
     executor: AgentExecutor, session_factory: Sessions, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     seed(session_factory, seats=0)
-    assigned = spy(monkeypatch, "assign_licence")
+    assigned = spy(monkeypatch, ASSIGN)
 
     run_id, _ = decide(executor, Script(call(ASSIGN), call(ASSIGN), GOAL_REACHED))
 
@@ -517,7 +519,7 @@ def test_reads_over_the_limit_are_refused_before_any_business_read(
     executor: AgentExecutor, session_factory: Sessions, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     seed(session_factory)
-    reads = spy(monkeypatch, "get_licence")
+    reads = spy(monkeypatch, CAPACITY)
     script = Script(call(*[CAPACITY] * (MAX_DECISION_READ_CALLS + 1)), GOAL_REACHED)
 
     run_id, _ = decide(executor, script)
@@ -911,10 +913,14 @@ def test_a_tool_failure_the_model_is_not_shown_ends_the_run_at_once(
 ) -> None:
     seed(session_factory)
 
-    def broken(*args: Any) -> Any:
-        raise RuntimeError(f"database said something about licence {FIGMA}")
+    real = tools.run
 
-    monkeypatch.setattr(tools, "get_licence", broken)
+    def broken(tool: Any, goal: Any, **services: Any) -> Any:
+        if tool == CAPACITY:
+            raise RuntimeError(f"database said something about licence {FIGMA}")
+        return real(tool, goal, **services)
+
+    monkeypatch.setattr(tools, "run", broken)
     script = Script(call(CAPACITY), GOAL_REACHED)
 
     run_id, _ = decide(executor, script)

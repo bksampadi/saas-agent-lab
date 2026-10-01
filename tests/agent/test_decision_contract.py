@@ -1,10 +1,9 @@
 """The decision stage's contract on its own, no database: the terminal
-outcome table, what the model is told, and the tool names every layer
-agrees on."""
+outcome table, what the model is told, and each tool's names."""
 
 import inspect
 import json
-from typing import cast, get_args
+from typing import get_args
 
 import pytest
 
@@ -18,9 +17,6 @@ from app.agent.decision import (
     decision_outcome,
     decision_task,
 )
-from app.agent.decision_tools import MODEL_TOOL_NAMES, GoalBoundTools
-from app.agent.executor import AgentExecutor, ToolCallOutcome
-from app.agent.planner import TargetTools
 from app.agent.pydantic_ai_decision import PROPOSAL_TOOLS, TARGET_TOOLS
 from app.models import (
     AgentRunStatus,
@@ -29,7 +25,6 @@ from app.models import (
     DesiredState,
     GoalType,
     OutcomeReason,
-    UserStatus,
 )
 from app.schemas.agent import (
     CannotProceed,
@@ -39,8 +34,6 @@ from app.schemas.agent import (
     NoActionNeeded,
     ResolvedAssignmentGoal,
     TargetToolName,
-    ToolInput,
-    UserSnapshot,
 )
 
 S = AgentRunStatus
@@ -243,71 +236,22 @@ def test_the_instructions_name_every_tool_and_conclusion() -> None:
         assert reason.value in DECISION_INSTRUCTIONS
 
 
-# --- names every layer agrees on ------------------------------------------------
+# --- each tool's names ------------------------------------------------------
 
 
-def public_methods(cls: type) -> set[str]:
-    return {
-        n
-        for n, _ in inspect.getmembers(cls, inspect.isfunction)
-        if not n.startswith("_")
-    }
-
-
-def test_every_layer_offers_the_same_four_tools() -> None:
+def test_each_tool_has_one_name_for_the_model_and_one_on_record() -> None:
     names = set(get_args(TargetToolName))
 
     assert len(names) == 4
     assert {tool.__name__ for tool in TARGET_TOOLS} == names
-    assert public_methods(TargetTools) == names
-    assert public_methods(GoalBoundTools) == names
-
-
-class RecordingExecutor:
-    """Stands in for AgentExecutor: records the call a goal-bound tool builds."""
-
-    def __init__(self) -> None:
-        self.tool_names: list[str] = []
-
-    def call_decision_tool(self, run_id: int, args: ToolInput) -> ToolCallOutcome:
-        self.tool_names.append(args.tool_name)
-        # Any successful outcome will do: only the tool name is checked.
-        return ToolCallOutcome(
-            tool_call_id=1,
-            sequence_no=1,
-            output=UserSnapshot(
-                user_id=1, email="ada@example.com", name="Ada", status=UserStatus.ACTIVE
-            ),
-            error=None,
-            run_status=AgentRunStatus.EXECUTING,
-            observation="{}",
-        )
-
-
-def test_each_tool_call_is_shown_under_the_model_facing_tool_that_made_it() -> None:
-    goal = ResolvedAssignmentGoal(
-        goal_type=GoalType.ENSURE_ASSIGNMENT,
-        desired_state=DesiredState.ASSIGNED,
-        user_id=48213,
-        licence_id=97531,
-        extracted_user_email="ada@example.com",
-        extracted_product="Figma",
-    )
-    executor = RecordingExecutor()
-    target_tools = GoalBoundTools(cast(AgentExecutor, executor), 7, goal)
-
-    for model_name in get_args(TargetToolName):
-        getattr(target_tools, model_name)()
-        assert MODEL_TOOL_NAMES[executor.tool_names[-1]] == model_name
-    assert set(MODEL_TOOL_NAMES) == {tool.tool_name for tool in tools.TOOL_INPUTS}
+    assert set(tools.RECORDED_NAMES) == names
+    # Distinct, so the public trace can show each recorded call by its tool.
+    assert len(set(tools.RECORDED_NAMES.values())) == len(names)
 
 
 def test_the_tools_take_nothing_but_the_run_context() -> None:
     for tool in TARGET_TOOLS:
         assert list(inspect.signature(tool).parameters) == ["ctx"]
-    for tool_name in get_args(TargetToolName):
-        method = getattr(GoalBoundTools, tool_name)
-        assert list(inspect.signature(method).parameters) == ["self"]
 
 
 def test_proposal_tools_match_the_persisted_proposal_kinds() -> None:
