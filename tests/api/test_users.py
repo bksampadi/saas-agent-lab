@@ -147,23 +147,6 @@ def test_create_user_failed_commit_is_not_reported_as_created(
 
 
 @pytest.mark.parametrize(
-    "headers",
-    [{}, {"X-Actor": ""}, {"X-Actor": "   "}, {"X-Actor": "a" * 321}],
-    ids=["missing", "empty", "whitespace", "too-long"],
-)
-def test_create_user_without_valid_actor_returns_422(
-    client: TestClient, session: Session, headers: dict[str, str]
-) -> None:
-    response = client.post(
-        "/users", json={"email": "ada@example.com", "name": "Ada"}, headers=headers
-    )
-
-    assert response.status_code == 422
-    assert count(session, User) == 0
-    assert count(session, AuditEvent) == 0
-
-
-@pytest.mark.parametrize(
     "payload",
     [
         {"name": "Ada"},

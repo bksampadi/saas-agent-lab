@@ -146,61 +146,6 @@ def test_assign_licence_neither_commits_nor_rolls_back(
     assert len(all_audit_events(session)) == 1
 
 
-def test_caller_commit_persists_assignment_and_audit_event_together(
-    service: AssignmentService, session: Session
-) -> None:
-    user = make_user(session)
-    licence = make_licence(session)
-
-    with session.begin():
-        service.assign_licence(user_id=user.id, licence_id=licence.id, actor=ACTOR)
-
-    # A rollback only discards uncommitted work, so both rows must survive it.
-    session.rollback()
-
-    assert len(all_assignments(session)) == 1
-    assert len(all_audit_events(session)) == 1
-
-
-def test_caller_rollback_discards_assignment_and_audit_event(
-    service: AssignmentService, session: Session
-) -> None:
-    user = make_user(session)
-    licence = make_licence(session)
-    service.assign_licence(user_id=user.id, licence_id=licence.id, actor=ACTOR)
-
-    session.rollback()
-
-    assert all_assignments(session) == []
-    assert all_audit_events(session) == []
-
-
-def test_audit_failure_leaves_neither_assignment_nor_audit_event_after_rollback(
-    service: AssignmentService, session: Session, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    user = make_user(session)
-    licence = make_licence(session)
-    real_add = AuditEventRepository.add
-    rows_before_failure: dict[str, int] = {}
-
-    def add_then_fail(self: AuditEventRepository, event: AuditEvent) -> AuditEvent:
-        real_add(self, event)  # the event row is now flushed, not committed
-        rows_before_failure["assignments"] = len(all_assignments(session))
-        rows_before_failure["audit_events"] = len(all_audit_events(session))
-        raise RuntimeError("simulated audit failure")
-
-    monkeypatch.setattr(AuditEventRepository, "add", add_then_fail)
-
-    # session.begin() plays the caller: it rolls back when the block raises.
-    with pytest.raises(RuntimeError, match="simulated audit failure"):
-        with session.begin():
-            service.assign_licence(user_id=user.id, licence_id=licence.id, actor=ACTOR)
-
-    assert rows_before_failure == {"assignments": 1, "audit_events": 1}
-    assert all_assignments(session) == []
-    assert all_audit_events(session) == []
-
-
 # --- missing or inactive user, missing licence --------------------------------
 
 
@@ -631,63 +576,6 @@ def test_revoke_assignment_neither_commits_nor_rolls_back(
     # The rejected second revoke did not undo the first, still uncommitted one.
     assert session.in_transaction()
     assert len(all_audit_events(session)) == 1
-
-
-def test_caller_commit_persists_revocation_and_audit_event_together(
-    service: AssignmentService, session: Session
-) -> None:
-    assignment = make_assignment(session, make_user(session), make_licence(session))
-
-    with session.begin():
-        service.revoke_assignment(assignment_id=assignment.id, actor=ACTOR)
-
-    # A rollback only discards uncommitted work, so both changes must survive.
-    session.rollback()
-
-    stored = session.get(Assignment, assignment.id)
-    assert stored is not None and stored.revoked_at is not None
-    assert [e.action for e in all_audit_events(session)] == ["assignment.revoke"]
-
-
-def test_caller_rollback_discards_revocation_and_audit_event(
-    service: AssignmentService, session: Session
-) -> None:
-    assignment = make_assignment(session, make_user(session), make_licence(session))
-    service.revoke_assignment(assignment_id=assignment.id, actor=ACTOR)
-
-    session.rollback()
-
-    stored = session.get(Assignment, assignment.id)
-    assert stored is not None and stored.revoked_at is None
-    assert all_audit_events(session) == []
-
-
-def test_revoke_audit_failure_leaves_assignment_active_after_rollback(
-    service: AssignmentService, session: Session, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    assignment = make_assignment(session, make_user(session), make_licence(session))
-    real_add = AuditEventRepository.add
-    revoked_in_db_before_failure: list[bool] = []
-
-    def add_then_fail(self: AuditEventRepository, event: AuditEvent) -> AuditEvent:
-        real_add(self, event)  # UPDATE and event are flushed, not committed
-        revoked_at = session.scalar(
-            select(Assignment.revoked_at).where(Assignment.id == assignment.id)
-        )
-        revoked_in_db_before_failure.append(revoked_at is not None)
-        raise RuntimeError("simulated audit failure")
-
-    monkeypatch.setattr(AuditEventRepository, "add", add_then_fail)
-
-    # session.begin() plays the caller: it rolls back when the block raises.
-    with pytest.raises(RuntimeError, match="simulated audit failure"):
-        with session.begin():
-            service.revoke_assignment(assignment_id=assignment.id, actor=ACTOR)
-
-    assert revoked_in_db_before_failure == [True]
-    stored = session.get(Assignment, assignment.id)
-    assert stored is not None and stored.revoked_at is None
-    assert all_audit_events(session) == []
 
 
 # --- revocation: effects on active assignments and capacity -------------------

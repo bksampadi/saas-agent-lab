@@ -1,6 +1,7 @@
 """The executor's steps on the one real path (receive, extract, resolve,
-decide): resolution, the business transaction around each tool call, what
-verification rests on, and the state each crash window leaves.
+decide): resolution, how a decision loop ends, the business transaction
+around each tool call, what verification rests on, and the state each crash
+window leaves.
 
 Decisions are made by a scripted model behind the production decision
 planner, or by a fake planner where only the executor's side matters.
@@ -22,7 +23,7 @@ import app.agent.executor as executor_module
 from app.agent import tools
 from app.agent.decision import DecisionStopped
 from app.agent.executor import AgentExecutor, RunNotExecutable
-from app.agent.planner import CallTool, DecisionModelCallRecorder
+from app.agent.planner import CallTool, DecisionModelCallRecorder, PlannerError
 from app.models import (
     AgentRun,
     AgentRunStatus,
@@ -31,7 +32,6 @@ from app.models import (
     Licence,
     OutcomeReason,
     PolicyDecision,
-    ToolCall,
     ToolCallStatus,
     User,
     UserStatus,
@@ -62,13 +62,17 @@ from support import (
     HUMAN,
     NO_ACTION_NEEDED,
     USER,
+    Crash,
     FakeDecisionPlanner,
     Script,
     Step,
+    add,
     call,
     cannot_proceed,
     extracted_run,
+    get_run,
     resolved_run,
+    tool_calls,
 )
 
 S = AgentRunStatus
@@ -77,13 +81,6 @@ Sessions = sessionmaker[Session]
 
 
 # --- helpers ------------------------------------------------------------------
-
-
-def add(sessions: Sessions, row: User | Licence | Assignment) -> int:
-    with sessions.begin() as session:
-        session.add(row)
-        session.flush()
-        return row.id
 
 
 def make_user(
@@ -106,27 +103,9 @@ def assign_as_human(sessions: Sessions, user_id: int, licence_id: int) -> int:
         )
 
 
-def get_run(sessions: Sessions, run_id: int) -> AgentRun:
-    with sessions() as session:
-        run = session.get(AgentRun, run_id)
-        assert run is not None
-        return run
-
-
 def outcome(sessions: Sessions, run_id: int) -> tuple[AgentRunStatus, R | None]:
     run = get_run(sessions, run_id)
     return run.status, run.outcome_reason
-
-
-def tool_calls(sessions: Sessions, run_id: int) -> list[ToolCall]:
-    with sessions() as session:
-        return list(
-            session.scalars(
-                select(ToolCall)
-                .where(ToolCall.agent_run_id == run_id)
-                .order_by(ToolCall.sequence_no)
-            )
-        )
 
 
 def assignments(sessions: Sessions) -> list[Assignment]:
@@ -156,10 +135,6 @@ def assign_then_conclude(
 ) -> DecisionProposal:
     call_tool(ASSIGN)
     return GoalReached()
-
-
-class Crash(BaseException):
-    """Stands in for the process dying: not an Exception, so nothing catches it."""
 
 
 def crash(*_: Any, **__: Any) -> None:
@@ -284,6 +259,80 @@ def test_a_resolver_crash_fails_the_run_without_keeping_its_message(
     run = get_run(session_factory, run_id)
     assert run.outcome_reason is R.UNEXPECTED_ERROR
     assert run.outcome_detail == {"stage": "resolution", "error_type": "RuntimeError"}
+
+
+# --- how a decision loop ends --------------------------------------------------
+
+
+def test_a_run_decides_only_once(executor: AgentExecutor, seed: Seed) -> None:
+    run_id = resolved_run(executor)
+    executor.decide(run_id, Script(NO_ACTION_NEEDED).planner())
+
+    with pytest.raises(RunNotExecutable):
+        executor.decide(run_id, Script(NO_ACTION_NEEDED).planner())
+
+
+@pytest.mark.parametrize(
+    ("error", "detail"),
+    [
+        (
+            PlannerError("timeout", "ModelAPIError"),
+            {"stage": "decision", "code": "timeout", "error_type": "ModelAPIError"},
+        ),
+        # Any other exception: its message, which may hold anything, is not kept.
+        (
+            RuntimeError("secret detail 48213"),
+            {"stage": "decision", "error_type": "RuntimeError"},
+        ),
+    ],
+    ids=["planner-error", "unexpected"],
+)
+def test_a_planner_failure_fails_the_run(
+    executor: AgentExecutor,
+    session_factory: Sessions,
+    seed: Seed,
+    error: Exception,
+    detail: dict[str, Any],
+) -> None:
+    def fail(*_: Any) -> DecisionProposal:
+        raise error
+
+    run_id = resolved_run(executor)
+    executor.decide(run_id, FakeDecisionPlanner(fail))
+
+    run = get_run(session_factory, run_id)
+    reason = R.PLANNER_ERROR if isinstance(error, PlannerError) else R.UNEXPECTED_ERROR
+    assert (run.status, run.outcome_reason, run.outcome_detail) == (
+        S.FAILED,
+        reason,
+        detail,
+    )
+
+
+def test_a_limit_ends_the_run_where_it_is_counted_and_stops_the_loop(
+    executor: AgentExecutor, session_factory: Sessions, seed: Seed
+) -> None:
+    ended: list[tuple[AgentRunStatus, OutcomeReason | None]] = []
+
+    def assign_twice(
+        context: DecisionContext, call_tool: CallTool, calls: DecisionModelCallRecorder
+    ) -> DecisionProposal:
+        call_tool(ASSIGN)
+        try:
+            call_tool(ASSIGN)
+        except DecisionStopped:
+            # An exception through the planner, not an observation; and the
+            # run has already ended, in the transaction that counted it.
+            run = get_run(session_factory, run_id)
+            ended.append((run.status, run.outcome_reason))
+            raise
+        return GoalReached()
+
+    run_id = resolved_run(executor)
+    status = executor.decide(run_id, FakeDecisionPlanner(assign_twice))
+
+    assert status is S.FAILED
+    assert ended == [(S.FAILED, R.STEP_LIMIT)]
 
 
 # --- the business transaction -------------------------------------------------

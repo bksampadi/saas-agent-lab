@@ -5,41 +5,10 @@ The column is added in place, not by rebuilding the table, so nothing that
 references a licence has to move. In memory only.
 """
 
-from collections.abc import Iterator
-from pathlib import Path
-
 import pytest
-from alembic import command
-from alembic.config import Config
-from sqlalchemy import Connection, Engine, text
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.pool import StaticPool
+from sqlalchemy import Engine, text
 
-from app.core.database import create_db_engine
-
-ALEMBIC_INI = Path(__file__).resolve().parents[1] / "alembic.ini"
-
-
-@pytest.fixture
-def engine() -> Iterator[Engine]:
-    engine = create_db_engine("sqlite://", poolclass=StaticPool)
-    yield engine
-    engine.dispose()
-
-
-def migrate(engine: Engine, revision: str, *, down: bool = False) -> None:
-    with engine.begin() as connection:
-        config = alembic_config(connection)
-        if down:
-            command.downgrade(config, revision)
-        else:
-            command.upgrade(config, revision)
-
-
-def alembic_config(connection: Connection) -> Config:
-    config = Config(str(ALEMBIC_INI))
-    config.attributes["connection"] = connection
-    return config
+from support import migrate
 
 
 def seed_0005(engine: Engine) -> None:
@@ -126,30 +95,6 @@ def test_upgrade_gives_every_existing_licence_the_allow_policy(
     assert [tuple(row) for row in tool_calls] == [(7, 1)]
     assert violations == []
     assert foreign_keys_on == 1
-
-
-@pytest.mark.parametrize("policy", ["allow", "require_approval", "deny"])
-def test_the_upgraded_schema_accepts_every_policy(engine: Engine, policy: str) -> None:
-    migrated(engine)
-
-    with engine.begin() as connection:
-        connection.execute(
-            text("UPDATE licences SET agent_policy = :policy WHERE id = 1"),
-            {"policy": policy},
-        )
-
-
-@pytest.mark.parametrize("policy", ["sometimes", "ALLOW", None])
-def test_the_upgraded_schema_rejects_an_unknown_or_missing_policy(
-    engine: Engine, policy: str | None
-) -> None:
-    migrated(engine)
-
-    with pytest.raises(IntegrityError), engine.begin() as connection:
-        connection.execute(
-            text("UPDATE licences SET agent_policy = :policy WHERE id = 1"),
-            {"policy": policy},
-        )
 
 
 def test_downgrade_drops_the_policy_and_keeps_every_licence(engine: Engine) -> None:

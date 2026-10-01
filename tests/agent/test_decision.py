@@ -9,9 +9,7 @@ boundary would be visible in what the model was sent.
 import json
 from typing import Any
 
-import pydantic_ai.models
 import pytest
-from pydantic_ai import ModelHTTPError
 from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
@@ -32,10 +30,8 @@ from app.agent.decision import (
     decision_context,
 )
 from app.agent.executor import AgentExecutor
-from app.agent.pydantic_ai_decision import OUTPUT_RETRIES, PydanticAIDecisionPlanner
-from app.core.config import Settings
+from app.agent.pydantic_ai_decision import OUTPUT_RETRIES
 from app.models import (
-    AgentRun,
     AgentRunStatus,
     Assignment,
     AuditEvent,
@@ -46,18 +42,15 @@ from app.models import (
     ModelCallStage,
     ModelCallStatus,
     OutcomeReason,
-    ToolCall,
     ToolCallStatus,
     User,
     UserStatus,
 )
-from app.repositories.agent_runs import AgentRunRepository
 from support import (
     ASSIGN,
     ASSIGNMENTS,
     CAPACITY,
     GOAL_REACHED,
-    MODEL,
     NO_ACTION_NEEDED,
     PROPOSALS,
     USER,
@@ -66,9 +59,14 @@ from support import (
     call,
     cannot_proceed,
     conclude,
+    count,
+    get_run,
+    model_calls,
     resolved_run,
+    tool_calls,
     usage,
 )
+from support import trace as persisted_trace
 
 Sessions = sessionmaker[Session]
 S = AgentRunStatus
@@ -122,13 +120,6 @@ def decide(executor: AgentExecutor, script: Script) -> tuple[int, AgentRunStatus
     return run_id, executor.decide(run_id, script.planner())
 
 
-def get_run(sessions: Sessions, run_id: int) -> AgentRun:
-    with sessions() as session:
-        run = session.get(AgentRun, run_id)
-        assert run is not None
-        return run
-
-
 def outcome(
     sessions: Sessions, run_id: int
 ) -> tuple[AgentRunStatus, OutcomeReason | None]:
@@ -139,41 +130,12 @@ def outcome(
 def trace(sessions: Sessions, run_id: int) -> list[tuple[str, str]]:
     """The run's trace in order: model calls by status, tool calls by name and
     status."""
-    with sessions() as session:
-        entries = AgentRunRepository(session).list_trace(run_id)
     return [
         ("model", entry.status.value)
         if isinstance(entry, ModelCall)
         else (entry.tool_name, entry.status.value)
-        for entry in entries
+        for entry in persisted_trace(sessions, run_id)
     ]
-
-
-def tool_calls(sessions: Sessions, run_id: int) -> list[ToolCall]:
-    with sessions() as session:
-        return list(
-            session.scalars(
-                select(ToolCall)
-                .where(ToolCall.agent_run_id == run_id)
-                .order_by(ToolCall.sequence_no)
-            )
-        )
-
-
-def model_calls(sessions: Sessions, run_id: int) -> list[ModelCall]:
-    with sessions() as session:
-        return list(
-            session.scalars(
-                select(ModelCall)
-                .where(ModelCall.agent_run_id == run_id)
-                .order_by(ModelCall.sequence_no)
-            )
-        )
-
-
-def count(sessions: Sessions, model: type[Any]) -> int:
-    with sessions() as session:
-        return len(session.scalars(select(model)).all())
 
 
 def detail(sessions: Sessions, run_id: int) -> dict[str, Any]:
@@ -283,28 +245,6 @@ def test_a_rejected_attempt_is_shown_to_the_model_which_may_carry_on(
 
 
 # --- already satisfied ------------------------------------------------------------
-
-
-def test_an_already_satisfied_goal_needs_no_action(
-    executor: AgentExecutor, session_factory: Sessions
-) -> None:
-    seed(session_factory, ada_holds=True)
-    script = Script(call(ASSIGNMENTS), NO_ACTION_NEEDED)
-
-    run_id, _ = decide(executor, script)
-
-    assert outcome(session_factory, run_id) == (S.COMPLETED, R.ALREADY_SATISFIED)
-    assert trace(session_factory, run_id) == [
-        MODEL_OK,
-        ("list_user_assignments", OK),
-        MODEL_OK,
-    ]
-    assert returned_to_model(script) == ['{"holds_active_seat":true}']
-    assert count(session_factory, Assignment) == 1
-    assert count(session_factory, AuditEvent) == 0
-    assert get_run(session_factory, run_id).decision_proposal is (
-        DecisionProposalKind.NO_ACTION_NEEDED
-    )
 
 
 def test_assigning_a_seat_already_held_is_shown_as_such_and_completes(
@@ -589,34 +529,6 @@ def test_rejected_responses_count_against_the_request_limit(
 # --- decision-stage model failures -----------------------------------------------
 
 
-def test_a_provider_failure_after_an_observation_fails_the_run_and_keeps_the_trace(
-    executor: AgentExecutor, session_factory: Sessions
-) -> None:
-    seed(session_factory)
-    script = Script(
-        call(CAPACITY), ModelHTTPError(status_code=500, model_name=MODEL, body=None)
-    )
-
-    run_id, status = decide(executor, script)
-
-    assert status is S.FAILED
-    run = get_run(session_factory, run_id)
-    assert (run.outcome_reason, run.outcome_detail) == (
-        R.PLANNER_ERROR,
-        {"stage": "decision", "code": "provider_error", "error_type": "ModelHTTPError"},
-    )
-    assert trace(session_factory, run_id) == [
-        MODEL_OK,
-        ("get_licence", OK),
-        MODEL_FAILED,
-    ]
-    assert model_calls(session_factory, run_id)[-1].error == {
-        "code": "provider_error",
-        "message": "The model provider returned HTTP 500.",
-        "error_type": "ModelHTTPError",
-    }
-
-
 def test_invalid_output_until_retries_run_out_fails_the_run(
     executor: AgentExecutor, session_factory: Sessions
 ) -> None:
@@ -708,20 +620,6 @@ def test_a_rejected_response_is_recorded_retried_and_runs_no_tool(
     assert isinstance(retry, ModelRequest)
     (feedback,) = [p for p in retry.parts if isinstance(p, RetryPromptPart)]
     assert message.split(":")[0] in str(feedback.content)
-
-
-def test_accepted_responses_are_recorded_as_closed_shapes(
-    executor: AgentExecutor, session_factory: Sessions
-) -> None:
-    seed(session_factory, seats=0)
-    script = Script(call(CAPACITY, USER), cannot_proceed("no_seats_available"))
-
-    run_id, _ = decide(executor, script)
-
-    assert [c.output for c in model_calls(session_factory, run_id)] == [
-        {"kind": "tool_calls", "tool_names": [CAPACITY, USER]},
-        {"kind": "cannot_proceed", "reason_code": "no_seats_available"},
-    ]
 
 
 # --- what crosses the model boundary ---------------------------------------------
@@ -853,54 +751,6 @@ def test_the_initial_context_is_persisted_first_id_free_and_exactly_as_sent(
     assert run.extracted_product is not None
     rebuilt = decision_context(run.extracted_user_email, run.extracted_product)
     assert rebuilt.model_dump(mode="json") == run.decision_context
-
-
-# --- the real default model is never called in tests -----------------------------
-
-DEFAULT_MODEL = Settings.model_fields["planner_model"].default
-
-
-def test_real_decision_requests_are_blocked_even_with_a_key(
-    executor: AgentExecutor,
-    session_factory: Sessions,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-not-a-real-key")
-    seed(session_factory)
-    run_id = resolved_run(executor)
-
-    assert pydantic_ai.models.ALLOW_MODEL_REQUESTS is False
-    executor.decide(run_id, PydanticAIDecisionPlanner(DEFAULT_MODEL, timeout_seconds=5))
-
-    # Refused before any network access, recorded, and the run ended.
-    assert outcome(session_factory, run_id) == (S.FAILED, R.UNEXPECTED_ERROR)
-    (call_record,) = model_calls(session_factory, run_id)
-    assert call_record.model_name == "claude-sonnet-5"
-    assert call_record.error is not None
-    assert call_record.error["error_type"] == "RuntimeError"
-    assert tool_calls(session_factory, run_id) == []
-
-
-def test_the_default_decision_model_needs_no_key_until_it_is_used(
-    executor: AgentExecutor,
-    session_factory: Sessions,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
-    seed(session_factory)
-    run_id = resolved_run(executor)
-
-    planner = PydanticAIDecisionPlanner(DEFAULT_MODEL, timeout_seconds=5)
-    executor.decide(run_id, planner)
-
-    run = get_run(session_factory, run_id)
-    assert (run.status, run.outcome_reason, run.outcome_detail) == (
-        S.FAILED,
-        R.PLANNER_ERROR,
-        {"stage": "decision", "code": "configuration_error", "error_type": "UserError"},
-    )
-    assert model_calls(session_factory, run_id) == []
 
 
 # --- failures the model is not shown -----------------------------------------------

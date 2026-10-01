@@ -1,40 +1,10 @@
 """Migration 0004 on a database that already holds agent runs, model calls
 and tool calls. SQLite rebuilds tool_calls here. In memory only."""
 
-from collections.abc import Iterator
-from pathlib import Path
-
 import pytest
-from alembic import command
-from alembic.config import Config
-from sqlalchemy import Connection, Engine, text
-from sqlalchemy.pool import StaticPool
+from sqlalchemy import Engine, text
 
-from app.core.database import create_db_engine
-
-ALEMBIC_INI = Path(__file__).resolve().parents[1] / "alembic.ini"
-
-
-@pytest.fixture
-def engine() -> Iterator[Engine]:
-    engine = create_db_engine("sqlite://", poolclass=StaticPool)
-    yield engine
-    engine.dispose()
-
-
-def migrate(engine: Engine, revision: str, *, down: bool = False) -> None:
-    with engine.begin() as connection:
-        config = alembic_config(connection)
-        if down:
-            command.downgrade(config, revision)
-        else:
-            command.upgrade(config, revision)
-
-
-def alembic_config(connection: Connection) -> Config:
-    config = Config(str(ALEMBIC_INI))
-    config.attributes["connection"] = connection
-    return config
+from support import migrate
 
 
 def seed_0003(engine: Engine) -> None:

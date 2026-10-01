@@ -1,23 +1,31 @@
-"""Support for tests that drive agent runs the way the API does.
+"""Shared test support, imported as ``support``.
 
-Runs go through the executor's real steps: receive, extract, resolve,
+Agent runs go through the executor's real steps: receive, extract, resolve,
 decide. Only the models are stood in for: extraction answered without a
 model request (FixedIntent), a scripted model behind the real PydanticAI
 planners (Script), or a planner that acts in place of a model loop
-(FakeDecisionPlanner).
+(FakeDecisionPlanner). The rest reads what a run persisted, counts open
+transactions, or runs the Alembic migrations.
 """
 
 from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
+from alembic import command
+from alembic.config import Config
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RequestUsage
+from sqlalchemy import Connection, Engine, select
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.agent.executor import AgentExecutor
 from app.agent.planner import CallTool, DecisionModelCallRecorder, ModelCallRecorder
 from app.agent.pydantic_ai_decision import PydanticAIDecisionPlanner
-from app.models import AgentRunStatus
+from app.models import AgentRun, AgentRunStatus, ModelCall, ToolCall
+from app.repositories.agent_runs import AgentRunRepository
 from app.schemas.agent import (
     DecisionContext,
     DecisionProposal,
@@ -28,6 +36,7 @@ from app.schemas.agent import (
 
 HUMAN = "admin@example.com"
 MODEL = "scripted-model"
+Sessions = sessionmaker[Session]
 
 # The model-facing tools and conclusions, by the names the model sees.
 USER: TargetToolName = "get_target_user"
@@ -94,6 +103,10 @@ class Script:
         self.steps = list(steps)
         self.requests: list[list[ModelMessage]] = []
         self.infos: list[AgentInfo] = []
+
+    def will(self, *steps: Step) -> None:
+        """Add steps, for a script handed out before the test knows them."""
+        self.steps.extend(steps)
 
     def respond(self, messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         self.requests.append(list(messages))
@@ -181,3 +194,102 @@ class FakeDecisionPlanner:
     ) -> DecisionProposal:
         self.contexts.append(context)
         return self.act(context, call_tool, calls)
+
+
+# --- reading what was persisted -----------------------------------------------
+#
+# Each read opens a short session of its own: a test never holds one open
+# across an executor call, which opens and commits its own.
+
+
+def add(sessions: Sessions, row: Any) -> int:
+    """Commit ``row`` and return its id."""
+    with sessions.begin() as session:
+        session.add(row)
+        session.flush()
+        return row.id
+
+
+def get_run(sessions: Sessions, run_id: int) -> AgentRun:
+    with sessions() as session:
+        run = session.get(AgentRun, run_id)
+        assert run is not None
+        return run
+
+
+def count(sessions: Sessions, model: type[Any]) -> int:
+    with sessions() as session:
+        return len(session.scalars(select(model)).all())
+
+
+def tool_calls(sessions: Sessions, run_id: int) -> list[ToolCall]:
+    with sessions() as session:
+        return list(
+            session.scalars(
+                select(ToolCall)
+                .where(ToolCall.agent_run_id == run_id)
+                .order_by(ToolCall.sequence_no)
+            )
+        )
+
+
+def model_calls(sessions: Sessions, run_id: int) -> list[ModelCall]:
+    with sessions() as session:
+        return list(
+            session.scalars(
+                select(ModelCall)
+                .where(ModelCall.agent_run_id == run_id)
+                .order_by(ModelCall.sequence_no)
+            )
+        )
+
+
+def trace(sessions: Sessions, run_id: int) -> list[ModelCall | ToolCall]:
+    """The run's model calls and tool calls, in trace order."""
+    with sessions() as session:
+        return AgentRunRepository(session).list_trace(run_id)
+
+
+# --- transactions and crashes -------------------------------------------------
+
+
+class Crash(BaseException):
+    """Stands in for the process dying: not an Exception, so nothing catches it."""
+
+
+@dataclass
+class TransactionCounter:
+    """Counts open transactions on an engine: listen to its "begin", "commit"
+    and "rollback" events with began and ended."""
+
+    open_now: int = 0
+    peak: int = 0
+
+    def began(self, *_: Any) -> None:
+        self.open_now += 1
+        self.peak = max(self.peak, self.open_now)
+
+    def ended(self, *_: Any) -> None:
+        self.open_now -= 1
+
+
+# --- migrations ---------------------------------------------------------------
+
+ALEMBIC_INI = Path(__file__).resolve().parents[1] / "alembic.ini"
+
+
+def alembic_config(connection: Connection) -> Config:
+    """Alembic's configuration, run against ``connection``, not the
+    configured database."""
+    config = Config(str(ALEMBIC_INI))
+    config.attributes["connection"] = connection
+    return config
+
+
+def migrate(engine: Engine, revision: str, *, down: bool = False) -> None:
+    with engine.begin() as connection:
+        config = alembic_config(connection)
+        if down:
+            command.downgrade(config, revision)
+        else:
+            command.upgrade(config, revision)

@@ -6,23 +6,28 @@ Build the application layer first: explicit boundaries, persistent state, migrat
 
 ## Current state
 
-Latest release: `v0.3.0` (everything below through Day 2C). `main` is in development toward the next milestone: version `0.4.0.dev0`.
+Latest release: `v0.3.0`. `main` is in development toward the next milestone, version `0.4.0.dev0`, and must not be released until approval work gives `AWAITING_APPROVAL` a way out.
 
-- v0.1 SaaS application: complete.
-- Day 1, deterministic agent execution foundation: complete. Persisted `AgentRun` and `ToolCall`, deterministic resolver, persisted resolved goal, goal-scoped executor with separate log and business transactions, audit actor `agent:run-<id>`, state-based verifier.
-- Day 2A, natural-language intent extraction: complete. PydanticAI turns an instruction into a closed `ExtractedIntent` union (`EnsureAssignmentIntent | NeedsClarification | Unsupported`). Every model request is persisted as a `ModelCall`; model calls and tool calls share one ordered trace per run.
-- Day 2B, bounded model-directed execution: complete. `AgentExecutor.decide` lets a model choose among four argument-free tools bound to the run's persisted goal (`agent/tools.py`), each call admitted and run by `AgentExecutor.call_tool`. The model concludes with a closed proposal (`GoalReached | NoActionNeeded | CannotProceed`). Id-free observations are persisted on each `ToolCall`, and the initial context on the run. Limits are enforced by application code (`step_limit`). The run's outcome comes from `decision.decision_outcome`, never from the proposal.
-- Day 2C, HTTP surface and live smoke test: complete. `POST /agent-runs` runs `AgentExecutor.run` synchronously through `agent/runs.py`; `GET /agent-runs/{run_id}` returns the persisted run, decision context, verification and ordered trace, id-free (`schemas/agent_runs.py`). One opt-in live test (`tests/live/`, marker `live`) drives a real model end to end.
-- Next: policy checks, approval checkpoints and cancellation, the first work after `v0.3.0` (see Roadmap). Not started.
+- SaaS application: users, licences, assignments and revocation behind a layered FastAPI API; every mutation writes its audit event in the same transaction.
+- Agent runs: `POST /agent-runs` runs one natural-language instruction synchronously through `AgentExecutor.run`, the only execution path:
+  1. receive: the run is persisted `RECEIVED` before any model is called;
+  2. extract: a PydanticAI intent planner returns a closed `ExtractedIntent` (`EnsureAssignmentIntent | NeedsClarification | Unsupported`); extracted text not found in the instruction is refused;
+  3. resolve: the deterministic resolver (`agent/resolver.py`) turns the extracted email and product into row ids, or the run needs clarification;
+  4. decide: a PydanticAI decision planner chooses among four argument-free tools (`agent/tools.py`). `AgentExecutor.call_tool` builds each call from the run's persisted goal, checks the run's limits and then policy (`agent/policy.py`), and only then runs it in its own business transaction. The model concludes with a closed proposal (`GoalReached | NoActionNeeded | CannotProceed`);
+  5. verify: the verifier (`agent/verifier.py`) reads committed state, and `decision.decision_outcome` sets the run's outcome; the proposal never does.
+- Policy: each licence has an `agent_policy` (`allow | require_approval | deny`, default `allow`). Deny ends the run `BLOCKED` (`policy_denied`); require_approval holds the call unrun and pauses the run `AWAITING_APPROVAL`. Neither opens a business transaction. Nothing leaves `AWAITING_APPROVAL` yet.
+- Trace: every model request (`ModelCall`) and tool call (`ToolCall`) is persisted, in one order per run. `GET /agent-runs/{run_id}` returns the run, its decision context, its verification and its trace, id-free (`schemas/agent_runs.py`).
+- One opt-in live test (`tests/live/`, marker `live`) drives a real model end to end.
+- Next: approval checkpoints, then cancellation (see Roadmap). Not started.
 
-LLM and model integration is permitted, within the authority boundary below. `AgentExecutor.run` is the only execution path: receive, extract, resolve, then hand the resolved run to a decision planner (`decide`). The Day 1 deterministic path was removed after `v0.3.0`.
+LLM and model integration is permitted, within the authority boundary below.
 
 ## Authority boundary
 
 Models interpret intent and choose bounded observations and actions. Deterministic application code owns everything else:
 
 - identity resolution (which user and licence rows are meant),
-- goal scope (what a run may touch),
+- the goal (a run's tools act on its persisted user and licence, never on ids a model names),
 - domain rules and policy,
 - transactions,
 - whether a tool call succeeded,
@@ -36,11 +41,11 @@ Released:
 
 - v0.1.0 SaaS application: CRUD, audit log, constraints, request transactions, tests, type checking
 - v0.2.0 agent execution foundation: persisted runs and tool calls, deterministic resolution, goal-scoped typed tools, traces, postcondition verification
-- v0.3.0 natural-language planning and bounded execution: intent extraction (Day 2A); bounded model-directed execution with id-free observations, deterministic verification and persisted model and tool traces (Day 2B); agent-run HTTP API and opt-in live-provider smoke test (Day 2C)
+- v0.3.0 natural-language planning and bounded execution: intent extraction; bounded model-directed execution with id-free observations, deterministic verification and persisted model and tool traces; agent-run HTTP API and opt-in live-provider smoke test
 
 Next milestone, in development on `main` (version `0.4.0.dev0`):
 
-1. policy checks
+1. policy checks (on `main`)
 2. approval checkpoints
 3. cancellation
 
@@ -63,11 +68,15 @@ Then a public release.
 
 ## Agent rules
 
-- `agent/` holds the executor, resolver, verifier, tools, observations, the decision contract (limits, context, outcome table) and planners. The executor opens its own short sessions: log transactions (runs, tool calls, model calls) and business transactions are never open at the same time, and no session is open while a model runs.
+- `agent/` holds the executor (`AgentExecutor.run`, each step and its transactions), the resolver, policy, the tools (what each does, and what the model is shown of it), the verifier, the decision contract (limits, context, outcome table), the planner boundary with its PydanticAI planners, and `runs.py` (start and read a run, for the API). The executor opens its own short sessions: log transactions (runs, tool calls, model calls) and business transactions are never open at the same time, and no session is open while a model runs.
+- Every status change happens in the executor, after it checks the status it starts from; the lifecycle is written on `AgentRunStatus`. A run ends only through `_end`, and an ended run never changes. Which reason goes with which ending is a CHECK constraint.
+- Policy is evaluated when a call is admitted (`_start_call`'s log transaction), after the run's limits and before any business transaction. Deny and require_approval never open a business transaction, and the model is asked nothing more.
+- A run with a `STARTED` tool call (no recorded outcome: its change may or may not have committed) is never continued or verified.
+- `ToolCall.tool_name` records the application operation (`tools.RECORDED_NAMES`); the model and the public trace use the tool's own name.
 - A model reaches the application only through a planner interface (`agent/planner.py`) with a fake-able implementation. Model output is a closed Pydantic union with `extra="forbid"`: no id fields, no free-form fields.
 - Every model request, accepted, rejected or failed, is persisted as a `ModelCall` as soon as it has an outcome. Retries are bounded by explicit constants.
 - `AgentRun.last_sequence_no` orders the trace and nothing else. It is not a limit.
-- Tests never send a real model request: `tests/conftest.py` sets `pydantic_ai.models.ALLOW_MODEL_REQUESTS = False`. Use `FunctionModel`, `TestModel` or a fake planner. No test needs an API key. The one exception is the live smoke test (`tests/live/`): deselected by default (`-m 'not live'` in addopts), skipped without the provider key, and the only place the guard is lifted (`override_allow_model_requests`). Never add a second one, and never retry it.
+- Tests never send a real model request: `tests/conftest.py` sets `pydantic_ai.models.ALLOW_MODEL_REQUESTS = False`. Use `FunctionModel`, `TestModel` or a fake planner. No test needs an API key. The one exception is the live smoke test (`tests/live/`): deselected by default (`-m 'not live'` in addopts), skipped without the provider key, and the only place the guard is lifted (`override_allow_model_requests`). Never add a second one, and never retry it. Shared test helpers live in `tests/support.py` (imported as `support`), shared fixtures in the `conftest.py` files.
 - Agent-run routes (`api/agent_runs.py`) are transport only and plain `def`. They take no request session or transaction: `agent/runs.py` gets the session factory (`deps.get_session_factory`). Planners are dependencies (`get_intent_planner`, `get_decision_planner`); API tests override them with scripted models.
 - The public API shows a run only through `schemas/agent_runs.py`: never a resolved id, tool arguments, internal results, error messages or raw `outcome_detail`. Expected agent outcomes are `201` with the outcome in the body, never an HTTP error. Verification is read from the `outcome_detail` persisted at the end of the run, never recomputed from current state.
 - Default model: `SAL_PLANNER_MODEL`, `anthropic:claude-sonnet-5`. Model comparison belongs to evaluation, not to defaults.
@@ -81,7 +90,7 @@ Then a public release.
   3. the persisted model-visible observation (`ToolCall.observation`): the exact, deterministic serialization of (2), written with the call's outcome and returned to the model as that same text.
   Never use the internal result itself as the model observation, and never build model-visible text from `str(exception)`: rejections are closed reason codes.
 - The initial model context (instructions and prompt) contains no ids and is persisted verbatim on the run (`decision_context`) before the first request.
-- Execution limits are separate, explicit counters: `MAX_DECISION_MODEL_REQUESTS`, `MAX_DECISION_READ_CALLS` and `MAX_DECISION_MUTATION_CALLS` (`agent/decision.py`), counted from persisted rows. A mutation attempt counts even if rejected. Reaching a limit is an exception that stops the loop and ends the run FAILED (`step_limit`), never an observation. Never derive a limit from `last_sequence_no`.
+- Execution limits are separate, explicit counters: `MAX_DECISION_MODEL_REQUESTS`, `MAX_DECISION_READ_CALLS` and `MAX_DECISION_MUTATION_CALLS` (`agent/decision.py`), counted from persisted rows. A mutation attempt counts even if rejected. Reaching a limit ends the run FAILED (`step_limit`) in the transaction that counts it and raises `DecisionStopped`, which stops the loop: never an observation. Never derive a limit from `last_sequence_no`.
 - A domain rejection of an allowed call is an observation: the model may react to it.
 - The model's proposal is recorded on the run and never sets its status. A `CannotProceed` reason blocks a run only when the application confirms it against current state (`verifier.check_block`).
 - No forced precondition sweep: nothing is read on the model's behalf.
@@ -89,7 +98,7 @@ Then a public release.
 ## Entities
 
 - `User(id, email, name, status: active|inactive, created_at)`
-- `Licence(id, product, seats_total)`
+- `Licence(id, product, seats_total, agent_policy: allow|require_approval|deny)`
 - `Assignment(id, user_id, licence_id, assigned_at, revoked_at nullable)`
 - `AuditEvent(id, actor, action, entity_type, entity_id, before, after, created_at)`
 - Agent: `AgentRun`, `ToolCall`, `ModelCall` (see `models/`)

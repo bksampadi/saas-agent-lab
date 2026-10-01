@@ -1,34 +1,22 @@
 """Extraction through the executor, with a fake planner in place of a model:
-the run's lifecycle and its persisted model calls. The run's ordered trace
-is tested in test_trace.py."""
+what an extracted intent becomes, and what ends a run before resolution.
+The PydanticAI planner itself is tested in test_pydantic_ai_planner.py."""
 
-import sqlite3
-from collections.abc import Callable, Iterator
-from uuid import uuid4
+from collections.abc import Callable
 
 import pytest
-from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import QueuePool
 
 from app.agent.executor import AgentExecutor, RunNotExecutable
 from app.agent.planner import ModelCallRecorder, PlannerError
-from app.core.database import create_db_engine
 from app.models import (
-    AgentRun,
     AgentRunStatus,
-    Assignment,
-    Base,
     DesiredState,
     GoalType,
     Licence,
-    ModelCall,
-    ModelCallStatus,
     OutcomeReason,
-    ToolCall,
     User,
 )
-from app.repositories.agent_runs import AgentRunRepository
 from app.schemas.agent import (
     EnsureAssignmentIntent,
     ExtractedIntent,
@@ -37,7 +25,7 @@ from app.schemas.agent import (
     NeedsClarification,
     Unsupported,
 )
-from app.services.assignments import AssignmentService
+from support import add, get_run, trace
 
 HUMAN = "admin@example.com"
 INSTRUCTION = "Give ada@example.com a Figma seat."
@@ -87,33 +75,6 @@ class FakePlanner:
             )
         )
         return self.answer
-
-
-# --- helpers ------------------------------------------------------------------
-
-
-def add(sessions: Sessions, row: User | Licence) -> int:
-    with sessions.begin() as session:
-        session.add(row)
-        session.flush()
-        return row.id
-
-
-def get_run(sessions: Sessions, run_id: int) -> AgentRun:
-    with sessions() as session:
-        run = session.get(AgentRun, run_id)
-        assert run is not None
-        return run
-
-
-def trace(sessions: Sessions, run_id: int) -> list[ModelCall | ToolCall]:
-    with sessions() as session:
-        return AgentRunRepository(session).list_trace(run_id)
-
-
-def rows(sessions: Sessions, model: type[ModelCall | ToolCall | Assignment]) -> int:
-    with sessions() as session:
-        return len(session.scalars(select(model)).all())
 
 
 def received(executor: AgentExecutor, instruction: str = INSTRUCTION) -> int:
@@ -220,28 +181,6 @@ def test_other_intents_end_the_run_needing_clarification_with_no_goal(
         executor.resolve_run(run_id)
 
 
-def test_a_planner_error_fails_the_run_and_keeps_the_failed_call(
-    executor: AgentExecutor, session_factory: Sessions
-) -> None:
-    run_id = received(executor)
-
-    status = executor.extract_intent(
-        run_id, FakePlanner(PlannerError("timeout", "ModelAPIError"))
-    )
-
-    assert status is AgentRunStatus.FAILED
-    run = get_run(session_factory, run_id)
-    assert run.outcome_reason is OutcomeReason.PLANNER_ERROR
-    assert run.outcome_detail == {
-        "stage": "extraction",
-        "code": "timeout",
-        "error_type": "ModelAPIError",
-    }
-    (call,) = trace(session_factory, run_id)
-    assert isinstance(call, ModelCall)
-    assert call.status is ModelCallStatus.FAILED
-
-
 def test_an_unexpected_planner_exception_fails_the_run(
     executor: AgentExecutor, session_factory: Sessions
 ) -> None:
@@ -304,47 +243,3 @@ def test_a_run_is_extracted_only_once(
 
     assert second.instructions == []  # the planner was never called
     assert len(trace(session_factory, run_id)) == 1
-
-
-# --- no lock is held while the planner runs ----------------------------------
-
-
-@pytest.fixture
-def locking_sessions() -> Iterator[Sessions]:
-    # As in test_isolation: every session has its own connection, so a
-    # transaction left open would make another writer fail at once.
-    name = f"agentlab-{uuid4().hex}"
-    keeper = sqlite3.connect(f"file:{name}?mode=memory&cache=shared", uri=True)
-    engine: Engine = create_db_engine(
-        f"sqlite:///file:{name}?mode=memory&cache=shared&uri=true",
-        poolclass=QueuePool,
-    )
-    Base.metadata.create_all(engine)
-    yield sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
-    engine.dispose()
-    keeper.close()
-
-
-def test_no_transaction_is_open_while_the_planner_runs(
-    locking_sessions: Sessions,
-) -> None:
-    ada = add(locking_sessions, User(email="ada@example.com", name="Ada"))
-    figma = add(locking_sessions, Licence(product="Figma", seats_total=5))
-
-    def business_write() -> None:
-        with locking_sessions.begin() as session:
-            AssignmentService(session).assign_licence(
-                user_id=ada, licence_id=figma, actor=HUMAN
-            )
-
-    executor = AgentExecutor(locking_sessions)
-    run_id = received(executor)
-
-    status = executor.extract_intent(
-        run_id, FakePlanner(ada_figma(), during=business_write)
-    )
-
-    # The write made while the planner ran committed, and so did extraction.
-    assert status is AgentRunStatus.RECEIVED
-    assert rows(locking_sessions, Assignment) == 1
-    assert get_run(locking_sessions, run_id).extracted_product == "Figma"

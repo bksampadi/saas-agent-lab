@@ -4,7 +4,6 @@ import httpx2
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_session
@@ -176,42 +175,6 @@ def test_create_licence_duplicate_product_race_returns_409(
     assert count(session, AuditEvent) == 1
     # The failed transaction was rolled back, so the next request works.
     assert client.get("/licences").status_code == 200
-
-
-def test_create_licence_unrelated_integrity_error_is_not_a_409(
-    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    real_add = LicenceRepository.add
-
-    def add_with_negative_seats(self: LicenceRepository, licence: Licence) -> Licence:
-        licence.seats_total = -1  # a real CHECK violation from SQLite
-        return real_add(self, licence)
-
-    monkeypatch.setattr(LicenceRepository, "add", add_with_negative_seats)
-
-    # Propagates as an unhandled server error, not a duplicate-product 409.
-    with pytest.raises(IntegrityError, match="CHECK constraint failed"):
-        post_licence(client)
-
-    assert count(session, Licence) == 0
-    assert count(session, AuditEvent) == 0
-
-
-@pytest.mark.parametrize(
-    "headers",
-    [{}, {"X-Actor": ""}, {"X-Actor": "   "}, {"X-Actor": "a" * 321}],
-    ids=["missing", "empty", "whitespace", "too-long"],
-)
-def test_create_licence_without_valid_actor_returns_422(
-    client: TestClient, session: Session, headers: dict[str, str]
-) -> None:
-    response = client.post(
-        "/licences", json={"product": "Figma", "seats_total": 5}, headers=headers
-    )
-
-    assert response.status_code == 422
-    assert count(session, Licence) == 0
-    assert count(session, AuditEvent) == 0
 
 
 @pytest.mark.parametrize(

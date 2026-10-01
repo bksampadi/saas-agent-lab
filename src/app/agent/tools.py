@@ -99,7 +99,7 @@ def run(
                 assignments=[AssignmentSnapshot.of(row) for row in rows],
             )
         case "assign_target_licence":
-            # The existing service call, audit event included, unchanged.
+            # The service writes the audit event with the change.
             assignment = assignments.assign_licence(
                 user_id=goal.user_id, licence_id=goal.licence_id, actor=actor
             )

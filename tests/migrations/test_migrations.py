@@ -3,35 +3,17 @@
 These run against in-memory SQLite only.
 """
 
-from collections.abc import Iterator
-from pathlib import Path
 from typing import Any
 
-import pytest
 from alembic import command
 from alembic.autogenerate import compare_metadata
-from alembic.config import Config
 from alembic.migration import MigrationContext
-from sqlalchemy import Connection, Engine, inspect
+from sqlalchemy import Engine, inspect
 from sqlalchemy.pool import StaticPool
 
 from app.core.database import create_db_engine
 from app.models import Base
-
-ALEMBIC_INI = Path(__file__).resolve().parents[1] / "alembic.ini"
-
-
-@pytest.fixture
-def empty_engine() -> Iterator[Engine]:
-    engine = create_db_engine("sqlite://", poolclass=StaticPool)
-    yield engine
-    engine.dispose()
-
-
-def alembic_config(connection: Connection) -> Config:
-    config = Config(str(ALEMBIC_INI))
-    config.attributes["connection"] = connection
-    return config
+from support import alembic_config
 
 
 def schema_names(engine: Engine) -> dict[str, dict[str, list[Any]]]:
@@ -51,35 +33,35 @@ def schema_names(engine: Engine) -> dict[str, dict[str, list[Any]]]:
     }
 
 
-def test_upgrade_head_matches_models(empty_engine: Engine) -> None:
-    with empty_engine.begin() as connection:
+def test_upgrade_head_matches_models(engine: Engine) -> None:
+    with engine.begin() as connection:
         command.upgrade(alembic_config(connection), "head")
         diff = compare_metadata(MigrationContext.configure(connection), Base.metadata)
 
     assert diff == []
 
 
-def test_upgrade_head_matches_model_constraint_names(empty_engine: Engine) -> None:
+def test_upgrade_head_matches_model_constraint_names(engine: Engine) -> None:
     # compare_metadata does not look at CHECK constraints or constraint names,
     # so compare the reflected names against a create_all() schema directly.
-    with empty_engine.begin() as connection:
+    with engine.begin() as connection:
         command.upgrade(alembic_config(connection), "head")
 
     reference = create_db_engine("sqlite://", poolclass=StaticPool)
     try:
         Base.metadata.create_all(reference)
-        assert schema_names(empty_engine) == schema_names(reference)
+        assert schema_names(engine) == schema_names(reference)
     finally:
         reference.dispose()
 
 
-def test_downgrade_base_removes_all_tables(empty_engine: Engine) -> None:
-    with empty_engine.begin() as connection:
+def test_downgrade_base_removes_all_tables(engine: Engine) -> None:
+    with engine.begin() as connection:
         config = alembic_config(connection)
         command.upgrade(config, "head")
         command.downgrade(config, "base")
 
-    assert inspect(empty_engine).get_table_names() == ["alembic_version"]
+    assert inspect(engine).get_table_names() == ["alembic_version"]
 
 
 def check_constraint_sql(engine: Engine) -> dict[str, dict[str | None, str]]:
@@ -91,29 +73,29 @@ def check_constraint_sql(engine: Engine) -> dict[str, dict[str | None, str]]:
     }
 
 
-def test_upgrade_head_matches_model_check_constraint_sql(empty_engine: Engine) -> None:
+def test_upgrade_head_matches_model_check_constraint_sql(engine: Engine) -> None:
     # Names alone would not catch a migration whose CHECK text drifted from
     # the model's.
-    with empty_engine.begin() as connection:
+    with engine.begin() as connection:
         command.upgrade(alembic_config(connection), "head")
 
     reference = create_db_engine("sqlite://", poolclass=StaticPool)
     try:
         Base.metadata.create_all(reference)
-        assert check_constraint_sql(empty_engine) == check_constraint_sql(reference)
+        assert check_constraint_sql(engine) == check_constraint_sql(reference)
     finally:
         reference.dispose()
 
 
 def test_downgrade_0002_leaves_the_initial_schema_and_upgrades_again(
-    empty_engine: Engine,
+    engine: Engine,
 ) -> None:
-    with empty_engine.begin() as connection:
+    with engine.begin() as connection:
         config = alembic_config(connection)
         command.upgrade(config, "head")
         command.downgrade(config, "0001")
 
-    assert sorted(inspect(empty_engine).get_table_names()) == [
+    assert sorted(inspect(engine).get_table_names()) == [
         "alembic_version",
         "assignments",
         "audit_events",
@@ -121,7 +103,7 @@ def test_downgrade_0002_leaves_the_initial_schema_and_upgrades_again(
         "users",
     ]
 
-    with empty_engine.begin() as connection:
+    with engine.begin() as connection:
         command.upgrade(alembic_config(connection), "head")
         diff = compare_metadata(MigrationContext.configure(connection), Base.metadata)
 

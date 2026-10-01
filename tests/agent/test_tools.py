@@ -21,19 +21,14 @@ from support import (
     NO_ACTION_NEEDED,
     USER,
     Script,
+    add,
     call,
+    count,
     resolved_run,
 )
 
 Sessions = sessionmaker[Session]
 BUSINESS_TABLES = ("users", "licences", "assignments", "audit_events")
-
-
-def add(sessions: Sessions, row: User | Licence | Assignment) -> int:
-    with sessions.begin() as session:
-        session.add(row)
-        session.flush()
-        return row.id
 
 
 def result_of(executor: AgentExecutor, sessions: Sessions, tool: str) -> dict[str, Any]:
@@ -47,11 +42,6 @@ def result_of(executor: AgentExecutor, sessions: Sessions, tool: str) -> dict[st
         ).all()
     assert tool_call.result is not None
     return tool_call.result
-
-
-def count(sessions: Sessions, model: type[Assignment] | type[AuditEvent]) -> int:
-    with sessions() as session:
-        return len(session.scalars(select(model)).all())
 
 
 @pytest.fixture

@@ -1,5 +1,6 @@
-"""The trace substrate: a run received before any model call, persisted model
-calls, and one ordered trace per run, shared by model calls and tool calls."""
+"""A run is received, and recorded, before any model is called; its model
+calls and tool calls form one trace, ordered by the run's own counter and
+never by timestamps."""
 
 from datetime import UTC, datetime
 
@@ -22,33 +23,21 @@ from app.models import (
 from app.repositories.agent_runs import AgentRunRepository
 from app.repositories.model_calls import ModelCallRepository
 from app.services.errors import InvalidInput
-from support import ASSIGN, ASSIGNMENTS, GOAL_REACHED, Script, call, conclude
+from support import (
+    ASSIGN,
+    ASSIGNMENTS,
+    GOAL_REACHED,
+    HUMAN,
+    Script,
+    add,
+    call,
+    conclude,
+    get_run,
+    trace,
+)
 
-HUMAN = "admin@example.com"
 INSTRUCTION = "Give ada@example.com a Figma seat."
 Sessions = sessionmaker[Session]
-
-
-# --- helpers ------------------------------------------------------------------
-
-
-def add(sessions: Sessions, row: User | Licence) -> int:
-    with sessions.begin() as session:
-        session.add(row)
-        session.flush()
-        return row.id
-
-
-def get_run(sessions: Sessions, run_id: int) -> AgentRun:
-    with sessions() as session:
-        run = session.get(AgentRun, run_id)
-        assert run is not None
-        return run
-
-
-def trace(sessions: Sessions, run_id: int) -> list[ModelCall | ToolCall]:
-    with sessions() as session:
-        return AgentRunRepository(session).list_trace(run_id)
 
 
 def record_model_call(sessions: Sessions, run_id: int) -> int:

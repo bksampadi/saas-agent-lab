@@ -14,26 +14,15 @@ from app.models import (
     AgentRunStatus,
     DesiredState,
     GoalType,
-    Licence,
     OutcomeReason,
     PolicyDecision,
     ToolCall,
     ToolCallStatus,
-    User,
 )
 
 NOW = datetime(2026, 9, 26, 12, 0, tzinfo=UTC)
 S = AgentRunStatus
 R = OutcomeReason
-
-
-@pytest.fixture
-def ids(session: Session) -> tuple[int, int]:
-    user = User(email="ada@example.com", name="Ada")
-    licence = Licence(product="Figma", seats_total=5)
-    session.add_all([user, licence])
-    session.flush()
-    return user.id, licence.id
 
 
 def agent_run(**overrides: Any) -> AgentRun:

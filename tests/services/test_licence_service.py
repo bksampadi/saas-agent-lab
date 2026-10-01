@@ -145,41 +145,6 @@ def test_create_licence_neither_commits_nor_rolls_back(
     assert [licence.product for licence in all_licences(session)] == ["Figma"]
 
 
-def test_caller_rollback_discards_licence_and_audit_event(
-    service: LicenceService, session: Session
-) -> None:
-    service.create_licence(product="Figma", seats_total=5, actor=ACTOR)
-
-    session.rollback()
-
-    assert all_licences(session) == []
-    assert all_audit_events(session) == []
-
-
-def test_audit_failure_leaves_neither_licence_nor_audit_event_after_rollback(
-    service: LicenceService, session: Session, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    real_add = AuditEventRepository.add
-    rows_before_failure: dict[str, int] = {}
-
-    def add_then_fail(self: AuditEventRepository, event: AuditEvent) -> AuditEvent:
-        real_add(self, event)  # the event row is now flushed, not committed
-        rows_before_failure["licences"] = len(all_licences(session))
-        rows_before_failure["audit_events"] = len(all_audit_events(session))
-        raise RuntimeError("simulated audit failure")
-
-    monkeypatch.setattr(AuditEventRepository, "add", add_then_fail)
-
-    # session.begin() plays the caller: it rolls back when the block raises.
-    with pytest.raises(RuntimeError, match="simulated audit failure"):
-        with session.begin():
-            service.create_licence(product="Figma", seats_total=5, actor=ACTOR)
-
-    assert rows_before_failure == {"licences": 1, "audit_events": 1}
-    assert all_licences(session) == []
-    assert all_audit_events(session) == []
-
-
 # --- duplicate products -------------------------------------------------------
 
 

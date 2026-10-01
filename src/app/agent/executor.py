@@ -7,7 +7,7 @@ There are two kinds of transaction, and they are never open at the same time:
 
 - log transactions write AgentRun and ToolCall rows;
 - a business transaction wraps one tool's service call and, for a change,
-  its AuditEvent. Services and repositories still never commit.
+  its AuditEvent. Services and repositories never commit.
 
 Every step opens a new session and closes it before the next one opens:
 

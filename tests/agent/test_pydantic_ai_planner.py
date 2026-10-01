@@ -13,7 +13,6 @@ import pydantic_ai.models
 import pytest
 from pydantic_ai import ModelAPIError, ModelHTTPError
 from pydantic_ai.messages import (
-    ModelMessage,
     ModelRequest,
     ModelResponse,
     RetryPromptPart,
@@ -21,10 +20,8 @@ from pydantic_ai.messages import (
     ToolCallPart,
     UserPromptPart,
 )
-from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.usage import RequestUsage
-from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.agent.executor import AgentExecutor
@@ -36,12 +33,10 @@ from app.agent.pydantic_ai_planner import (
 )
 from app.core.config import Settings
 from app.models import (
-    AgentRun,
     AgentRunStatus,
     Assignment,
     AuditEvent,
     Licence,
-    ModelCall,
     ModelCallStage,
     ModelCallStatus,
     OutcomeReason,
@@ -54,14 +49,11 @@ from app.schemas.agent import (
     NeedsClarification,
     Unsupported,
 )
-from support import Script as DecisionScript
+from support import HUMAN, MODEL, Script, count, get_run, model_calls
 
-HUMAN = "admin@example.com"
-MODEL = "scripted-model"
 # The declared default, not whatever a developer's .env or environment sets.
 DEFAULT_MODEL = Settings.model_fields["planner_model"].default
 Sessions = sessionmaker[Session]
-Step = ModelResponse | Exception
 
 
 # --- helpers ------------------------------------------------------------------
@@ -90,27 +82,6 @@ class Recorder:
         self.calls.append(call)
 
 
-class Script:
-    """A FunctionModel that answers with ``steps`` in order, raising any
-    exception step, and keeps the messages it was sent."""
-
-    def __init__(self, *steps: Step) -> None:
-        self.steps = list(steps)
-        self.requests: list[list[ModelMessage]] = []
-        self.infos: list[AgentInfo] = []
-
-    def respond(self, messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        self.requests.append(list(messages))
-        self.infos.append(info)
-        step = self.steps.pop(0)
-        if isinstance(step, Exception):
-            raise step
-        return step
-
-    def model(self) -> FunctionModel:
-        return FunctionModel(self.respond, model_name=MODEL)
-
-
 def result(tool: str, **args: Any) -> ModelResponse:
     return ModelResponse(
         parts=[ToolCallPart(tool, args)],
@@ -118,7 +89,9 @@ def result(tool: str, **args: Any) -> ModelResponse:
     )
 
 
-def assignment(user_email: str = "ada@example.com", product: str = "Figma") -> Step:
+def assignment(
+    user_email: str = "ada@example.com", product: str = "Figma"
+) -> ModelResponse:
     return result("ensure_assignment", user_email=user_email, product=product)
 
 
@@ -126,29 +99,6 @@ def planner(script: Script, clock: Callable[[], float] | None = None):
     return PydanticAIIntentPlanner(
         script.model(), timeout_seconds=5, clock=clock or Clock()
     )
-
-
-def model_calls(sessions: Sessions, run_id: int) -> list[ModelCall]:
-    with sessions() as session:
-        return list(
-            session.scalars(
-                select(ModelCall)
-                .where(ModelCall.agent_run_id == run_id)
-                .order_by(ModelCall.sequence_no)
-            )
-        )
-
-
-def get_run(sessions: Sessions, run_id: int) -> AgentRun:
-    with sessions() as session:
-        run = session.get(AgentRun, run_id)
-        assert run is not None
-        return run
-
-
-def count(sessions: Sessions, model: type[Any]) -> int:
-    with sessions() as session:
-        return len(session.scalars(select(model)).all())
 
 
 def extract(executor: AgentExecutor, script: Script, instruction: str) -> int:
@@ -160,7 +110,7 @@ def extract(executor: AgentExecutor, script: Script, instruction: str) -> int:
 def run_to_the_end(executor: AgentExecutor, script: Script, instruction: str) -> int:
     """The whole run (AgentExecutor.run), with ``script`` as the extraction
     model. Its decision model is never asked anything."""
-    decision = DecisionScript()
+    decision = Script()
     run_id = executor.run(
         instruction=instruction,
         requesting_actor=HUMAN,

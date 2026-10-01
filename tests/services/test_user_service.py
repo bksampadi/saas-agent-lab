@@ -116,61 +116,6 @@ def test_create_user_neither_commits_nor_rolls_back(
     assert [user.email for user in all_users(session)] == ["ada@example.com"]
 
 
-def test_caller_rollback_discards_several_service_calls(
-    service: UserService, session: Session
-) -> None:
-    service.create_user(email="ada@example.com", name="Ada", actor=ACTOR)
-    service.create_user(email="grace@example.com", name="Grace", actor=ACTOR)
-
-    session.rollback()
-
-    assert all_users(session) == []
-    assert all_audit_events(session) == []
-
-
-def test_caller_commit_persists_several_service_calls(
-    service: UserService, session: Session
-) -> None:
-    service.create_user(email="ada@example.com", name="Ada", actor=ACTOR)
-    service.create_user(email="grace@example.com", name="Grace", actor=ACTOR)
-    session.commit()
-
-    # A rollback only discards uncommitted work, so both survive it.
-    session.rollback()
-
-    assert [user.email for user in all_users(session)] == [
-        "ada@example.com",
-        "grace@example.com",
-    ]
-    assert len(all_audit_events(session)) == 2
-
-
-def test_audit_failure_leaves_neither_user_nor_audit_event_after_rollback(
-    service: UserService, session: Session, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    real_add = AuditEventRepository.add
-    rows_before_failure: dict[str, int] = {}
-
-    def add_then_fail(self: AuditEventRepository, event: AuditEvent) -> AuditEvent:
-        real_add(self, event)  # the event row is now flushed, not committed
-        rows_before_failure["users"] = len(all_users(session))
-        rows_before_failure["audit_events"] = len(all_audit_events(session))
-        raise RuntimeError("simulated audit failure")
-
-    monkeypatch.setattr(AuditEventRepository, "add", add_then_fail)
-
-    # session.begin() plays the caller: it rolls back when the block raises.
-    with pytest.raises(RuntimeError, match="simulated audit failure"):
-        with session.begin():
-            service.create_user(email="ada@example.com", name="Ada", actor=ACTOR)
-
-    # Both rows existed inside the transaction...
-    assert rows_before_failure == {"users": 1, "audit_events": 1}
-    # ...and the caller's rollback removed both.
-    assert all_users(session) == []
-    assert all_audit_events(session) == []
-
-
 # --- duplicate emails ---------------------------------------------------------
 
 

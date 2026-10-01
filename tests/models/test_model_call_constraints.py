@@ -15,12 +15,10 @@ from app.models import (
     AgentRunStatus,
     DesiredState,
     GoalType,
-    Licence,
     ModelCall,
     ModelCallStage,
     ModelCallStatus,
     OutcomeReason,
-    User,
 )
 
 NOW = datetime(2026, 9, 27, 12, 0, tzinfo=UTC)
@@ -32,15 +30,6 @@ GOAL = {
     "extracted_user_email": "ada@example.com",
     "extracted_product": "Figma",
 }
-
-
-@pytest.fixture
-def ids(session: Session) -> tuple[int, int]:
-    user = User(email="ada@example.com", name="Ada")
-    licence = Licence(product="Figma", seats_total=5)
-    session.add_all([user, licence])
-    session.flush()
-    return user.id, licence.id
 
 
 def add_run(session: Session, **values: Any) -> AgentRun:

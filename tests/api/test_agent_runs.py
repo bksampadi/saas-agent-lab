@@ -9,11 +9,9 @@ text.
 """
 
 import inspect
-import sqlite3
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
-from uuid import uuid4
 
 import httpx2
 import pytest
@@ -22,18 +20,13 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from pydantic_ai import ModelHTTPError
 from pydantic_ai.messages import (
-    ModelMessage,
     ModelRequest,
     ModelResponse,
-    ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
 )
-from pydantic_ai.models.function import AgentInfo, FunctionModel
-from pydantic_ai.usage import RequestUsage
 from sqlalchemy import Engine, event, select
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import QueuePool
 
 from app.agent.decision import (
     MAX_DECISION_MODEL_REQUESTS,
@@ -51,22 +44,35 @@ from app.api.deps import (
     get_transaction,
 )
 from app.core.config import Settings, get_settings
-from app.core.database import create_db_engine, get_session
+from app.core.database import get_session
 from app.main import create_app
 from app.models import (
     AgentRun,
     Assignment,
     AuditEvent,
-    Base,
     Licence,
     PolicyDecision,
     ToolCall,
     User,
     UserStatus,
 )
+from support import (
+    ASSIGN,
+    ASSIGNMENTS,
+    CAPACITY,
+    GOAL_REACHED,
+    MODEL,
+    NO_ACTION_NEEDED,
+    USER,
+    Script,
+    TransactionCounter,
+    call,
+    cannot_proceed,
+    conclude,
+    count,
+)
 
 HUMAN = "requesting-user@example.com"
-MODEL = "scripted-model"
 EMAIL = "ada@example.com"
 PRODUCT = "GitHub Enterprise"
 INSTRUCTION = "Ensure ada@example.com has a GitHub Enterprise licence"
@@ -78,74 +84,10 @@ GHE = 9753124
 HELD = 8642097  # Ada's assignment, when she already holds a seat
 OTHERS = 3640011  # other users, and their assignments, from here up
 
-USER = "get_target_user"
-CAPACITY = "get_target_licence_capacity"
-ASSIGNMENTS = "list_target_user_assignments"
-ASSIGN = "assign_target_licence"
-
-Step = ModelResponse | Exception | Callable[[], ModelResponse]
-
-
-# --- scripted models ------------------------------------------------------------
-
-
-@dataclass
-class Script:
-    """A FunctionModel that answers each request with the next step, and keeps
-    what it was sent. A step may be an exception to raise, or a callable run
-    when the request arrives."""
-
-    steps: list[Step] = field(default_factory=list)
-    requests: list[list[ModelMessage]] = field(default_factory=list)
-    infos: list[AgentInfo] = field(default_factory=list)
-
-    def will(self, *steps: Step) -> None:
-        self.steps.extend(steps)
-
-    def respond(self, messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        self.requests.append(list(messages))
-        self.infos.append(info)
-        step = self.steps.pop(0)
-        if isinstance(step, Exception):
-            raise step
-        if isinstance(step, ModelResponse):
-            return step
-        return step()
-
-    def model(self) -> FunctionModel:
-        return FunctionModel(self.respond, model_name=MODEL)
-
-    def sent_parts(self) -> list[Any]:
-        """Every request part the model was sent: the last request carries
-        the whole conversation."""
-        last = self.requests[-1] if self.requests else []
-        return [p for m in last if isinstance(m, ModelRequest) for p in m.parts]
-
-
-def usage() -> RequestUsage:
-    return RequestUsage(input_tokens=120, output_tokens=15)
-
-
-def answer(tool_name: str, **args: Any) -> ModelResponse:
-    return ModelResponse(parts=[ToolCallPart(tool_name, args)], usage=usage())
-
 
 def extracted(user_email: str = EMAIL, product: str = PRODUCT) -> ModelResponse:
-    return answer("ensure_assignment", user_email=user_email, product=product)
-
-
-def call(*tool_names: str) -> ModelResponse:
-    return ModelResponse(
-        parts=[ToolCallPart(name, {}) for name in tool_names], usage=usage()
-    )
-
-
-GOAL_REACHED = answer("goal_reached")
-NO_ACTION_NEEDED = answer("no_action_needed")
-
-
-def cannot_proceed(reason: str) -> ModelResponse:
-    return answer("cannot_proceed", reason_code=reason)
+    """What the extraction model answers for an assignment."""
+    return conclude("ensure_assignment", user_email=user_email, product=product)
 
 
 # --- the API --------------------------------------------------------------------
@@ -241,11 +183,6 @@ def seed(
             session.add(User(id=other, email=f"u{n}@example.com", name=f"U{n}"))
             session.flush()
             session.add(Assignment(id=other, user_id=other, licence_id=GHE))
-
-
-def count(sessions: Sessions, model: type[Any]) -> int:
-    with sessions() as session:
-        return len(session.scalars(select(model)).all())
 
 
 def outcome(body: dict[str, Any]) -> tuple[str, str | None, str | None]:
@@ -457,7 +394,7 @@ def test_an_unclear_instruction_needs_clarification_and_nothing_is_decided(
     api: AgentApi, kind: str, code: str, reason: str
 ) -> None:
     seed(api.sessions)
-    api.extraction.will(answer(kind, reason_code=code))
+    api.extraction.will(conclude(kind, reason_code=code))
 
     body = api.run("Give ada@example.com and bob@example.com GitHub Enterprise")
 
@@ -647,8 +584,8 @@ def test_get_returns_the_persisted_trace_in_order_as_the_model_saw_it(
         "stage": "extraction",
         "model": MODEL,
         "status": "succeeded",
-        "input_tokens": 120,
-        "output_tokens": 15,
+        "input_tokens": 100,
+        "output_tokens": 10,
         "latency_ms": trace[0]["latency_ms"],
         "output": {
             "kind": "ensure_assignment",
@@ -853,36 +790,6 @@ def test_the_agent_endpoints_are_synchronous_and_take_no_request_transaction() -
         calls = dependency_calls(route.dependant)
         assert get_transaction not in calls
         assert get_session not in calls
-
-
-@dataclass
-class TransactionCounter:
-    open_now: int = 0
-    peak: int = 0
-
-    def began(self, *_: Any) -> None:
-        self.open_now += 1
-        self.peak = max(self.peak, self.open_now)
-
-    def ended(self, *_: Any) -> None:
-        self.open_now -= 1
-
-
-@pytest.fixture
-def locking_engine() -> Iterator[Engine]:
-    # As in tests/agent/test_isolation.py: every session has its own
-    # connection, so a transaction left open would make another writer fail
-    # at once instead of silently sharing it.
-    name = f"agentlab-{uuid4().hex}"
-    keeper = sqlite3.connect(f"file:{name}?mode=memory&cache=shared", uri=True)
-    engine = create_db_engine(
-        f"sqlite:///file:{name}?mode=memory&cache=shared&uri=true",
-        poolclass=QueuePool,
-    )
-    Base.metadata.create_all(engine)
-    yield engine
-    engine.dispose()
-    keeper.close()
 
 
 @pytest.fixture

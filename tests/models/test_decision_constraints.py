@@ -18,9 +18,7 @@ from app.models import (
     DecisionProposalKind,
     DesiredState,
     GoalType,
-    Licence,
     OutcomeReason,
-    User,
 )
 
 NOW = datetime(2026, 9, 27, 12, 0, tzinfo=UTC)
@@ -28,15 +26,6 @@ S = AgentRunStatus
 R = OutcomeReason
 P = DecisionProposalKind
 CONTEXT = {"instructions": "You work for...", "prompt": "The goal: ..."}
-
-
-@pytest.fixture
-def ids(session: Session) -> tuple[int, int]:
-    user = User(email="ada@example.com", name="Ada")
-    licence = Licence(product="Figma", seats_total=5)
-    session.add_all([user, licence])
-    session.flush()
-    return user.id, licence.id
 
 
 def add_run(session: Session, ids: tuple[int, int], **values: Any) -> AgentRun:
@@ -64,7 +53,7 @@ def terminal(status: AgentRunStatus, reason: OutcomeReason) -> dict[str, Any]:
 
 
 VALID_RUNS = {
-    "deterministic": {},
+    "executing": {},
     "deciding": {"decision_context": CONTEXT},
     "verifying-a-proposal": {
         "status": S.VERIFYING,

@@ -1,11 +1,13 @@
+import sqlite3
 from collections.abc import Iterator
+from uuid import uuid4
 
 import pydantic_ai.models
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import QueuePool, StaticPool
 
 from app.core.database import create_db_engine, get_session
 from app.main import create_app
@@ -26,6 +28,29 @@ def engine() -> Iterator[Engine]:
     Base.metadata.create_all(engine)
     yield engine
     engine.dispose()
+
+
+@pytest.fixture
+def locking_engine() -> Iterator[Engine]:
+    """An in-memory database that locks as a real one does.
+
+    With ``engine`` (StaticPool) every session shares one connection, so
+    overlapping transactions cannot lock: they silently share one instead.
+    Here every session has its own connection, and a second writer fails at
+    once with "database table is locked", so a transaction left open is
+    caught rather than shared.
+    """
+    name = f"agentlab-{uuid4().hex}"
+    # The database lives while at least one connection to it is open.
+    keeper = sqlite3.connect(f"file:{name}?mode=memory&cache=shared", uri=True)
+    engine = create_db_engine(
+        f"sqlite:///file:{name}?mode=memory&cache=shared&uri=true",
+        poolclass=QueuePool,
+    )
+    Base.metadata.create_all(engine)
+    yield engine
+    engine.dispose()
+    keeper.close()
 
 
 @pytest.fixture

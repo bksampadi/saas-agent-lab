@@ -1,12 +1,12 @@
 """Policy at call admission: allow, deny and require_approval.
 
-A mutation is checked against policy when AgentExecutor._start_call admits
-it, after its goal scope and the run's limits. Denied, it never runs and the
-run ends BLOCKED; held for approval, it never runs and the run pauses. In
-both cases no business transaction opens, and a model is asked nothing more.
-The tests drive the real PydanticAI planner with a scripted model
-(FunctionModel), so the stop is checked through the actual tool scheduling
-and exception propagation.
+The mutation is checked against policy when AgentExecutor._start_call admits
+it, after the run's limits. Denied, it never runs and the run ends BLOCKED;
+held for approval, it never runs and the run pauses. In both cases no
+business transaction opens, and the model is asked nothing more. The tests
+drive the real PydanticAI planner with a scripted model (FunctionModel), so
+the stop is checked through the actual tool scheduling and exception
+propagation.
 """
 
 from collections.abc import Callable
@@ -20,14 +20,12 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.agent import policy, tools
 from app.agent.executor import AgentExecutor, RunNotExecutable
 from app.models import (
-    AgentRun,
     AgentRunStatus,
     Assignment,
     AuditEvent,
     Licence,
     OutcomeReason,
     PolicyDecision,
-    ToolCall,
     ToolCallStatus,
     User,
 )
@@ -47,7 +45,9 @@ from support import (
     Script,
     call,
     directed_run,
+    get_run,
     resolved_run,
+    tool_calls,
 )
 
 Sessions = sessionmaker[Session]
@@ -88,24 +88,6 @@ def full_run(executor: AgentExecutor) -> int:
     return directed_run(
         executor, Script(call(ASSIGNMENTS), call(CAPACITY), call(ASSIGN), GOAL_REACHED)
     )
-
-
-def get_run(sessions: Sessions, run_id: int) -> AgentRun:
-    with sessions() as session:
-        run = session.get(AgentRun, run_id)
-        assert run is not None
-        return run
-
-
-def tool_calls(sessions: Sessions, run_id: int) -> list[ToolCall]:
-    with sessions() as session:
-        return list(
-            session.scalars(
-                select(ToolCall)
-                .where(ToolCall.agent_run_id == run_id)
-                .order_by(ToolCall.sequence_no)
-            )
-        )
 
 
 def mutations(sessions: Sessions) -> tuple[int, int]:
@@ -198,7 +180,7 @@ def test_reads_are_not_governed_by_policy(
 # --- each decision, recorded with its call ---------------------------------------
 
 
-def test_an_allowed_assignment_runs_as_before_and_records_the_decision(
+def test_an_allowed_assignment_runs_and_records_the_decision(
     executor: AgentExecutor, session_factory: Sessions, business: list[str]
 ) -> None:
     seed(session_factory, ALLOW)

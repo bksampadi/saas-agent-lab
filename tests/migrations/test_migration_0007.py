@@ -5,43 +5,13 @@ SQLite rebuilds agent_runs and tool_calls in this migration, with the trace
 rows set aside meanwhile (as in 0005). In memory only.
 """
 
-from collections.abc import Iterator
-from pathlib import Path
-
 import pytest
-from alembic import command
-from alembic.config import Config
 from sqlalchemy import Connection, Engine, text
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.pool import StaticPool
 
-from app.core.database import create_db_engine
+from support import migrate
 
-ALEMBIC_INI = Path(__file__).resolve().parents[1] / "alembic.ini"
 OBSERVATION = '{"seats_active":0,"seats_available":5,"seats_total":5}'
 ASSIGN_ARGUMENTS = '{"user_id": 1, "licence_id": 1}'
-
-
-@pytest.fixture
-def engine() -> Iterator[Engine]:
-    engine = create_db_engine("sqlite://", poolclass=StaticPool)
-    yield engine
-    engine.dispose()
-
-
-def migrate(engine: Engine, revision: str, *, down: bool = False) -> None:
-    with engine.begin() as connection:
-        config = alembic_config(connection)
-        if down:
-            command.downgrade(config, revision)
-        else:
-            command.upgrade(config, revision)
-
-
-def alembic_config(connection: Connection) -> Config:
-    config = Config(str(ALEMBIC_INI))
-    config.attributes["connection"] = connection
-    return config
 
 
 def seed_0006(engine: Engine) -> None:
@@ -167,55 +137,6 @@ def test_upgrade_keeps_every_run_and_trace_row_with_no_policy_decision(
     assert types["policy_decision"] == "VARCHAR(32)"
     assert violations == []
     assert foreign_keys_on == 1
-
-
-def hold_run_8(connection: Connection, decision: str | None) -> None:
-    connection.execute(
-        text("UPDATE agent_runs SET status = 'awaiting_approval' WHERE id = 8")
-    )
-    connection.execute(
-        text(
-            "INSERT INTO tool_calls (agent_run_id, sequence_no, tool_name, "
-            "arguments, status, policy_decision, created_at) VALUES (8, 4, "
-            "'assign_licence', :arguments, 'awaiting_approval', :decision, "
-            "'2026-09-29')"
-        ),
-        {"arguments": ASSIGN_ARGUMENTS, "decision": decision},
-    )
-
-
-def test_the_upgraded_schema_stores_a_paused_run_and_a_denied_call(
-    engine: Engine,
-) -> None:
-    migrated(engine)
-
-    with engine.begin() as connection:
-        hold_run_8(connection, "require_approval")
-    with engine.begin() as connection:
-        connection.execute(
-            text(
-                "UPDATE agent_runs SET status = 'blocked', "
-                "outcome_reason = 'policy_denied', completed_at = '2026-09-29' "
-                "WHERE id = 8"
-            )
-        )
-        connection.execute(
-            text(
-                "UPDATE tool_calls SET status = 'failed', policy_decision = 'deny', "
-                "error = '{\"code\": \"policy_denied\"}', completed_at = '2026-09-29' "
-                "WHERE agent_run_id = 8"
-            )
-        )
-
-
-@pytest.mark.parametrize("decision", [None, "allow", "deny"])
-def test_the_upgraded_schema_holds_a_call_only_when_approval_was_required(
-    engine: Engine, decision: str | None
-) -> None:
-    migrated(engine)
-
-    with pytest.raises(IntegrityError), engine.begin() as connection:
-        hold_run_8(connection, decision)
 
 
 def test_downgrade_keeps_what_0006_can_store(engine: Engine) -> None:
