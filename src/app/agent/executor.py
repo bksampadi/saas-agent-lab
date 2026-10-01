@@ -129,15 +129,7 @@ from app.schemas.agent import (
     Unsupported,
 )
 from app.services.assignments import AssignmentService
-from app.services.errors import (
-    AssignmentAlreadyExists,
-    DomainError,
-    InvalidInput,
-    LicenceNotFound,
-    NoSeatsAvailable,
-    UserInactive,
-    UserNotFound,
-)
+from app.services.errors import InvalidInput
 from app.services.licences import LicenceService
 from app.services.users import UserService
 from app.services.validation import agent_run_actor, validated_external_actor
@@ -146,25 +138,6 @@ INSTRUCTION_MAX_LENGTH = 2000
 
 STEP_LIMIT = "step_limit"
 POLICY_DENIED = "policy_denied"
-UNEXPECTED_ERROR = "unexpected_error"
-
-# The domain errors a tool can raise, by the code recorded for each. Any
-# other domain error would be recorded as "domain_error".
-_DOMAIN_ERROR_CODES: dict[type[DomainError], str] = {
-    InvalidInput: "invalid_input",
-    UserNotFound: "user_not_found",
-    LicenceNotFound: "licence_not_found",
-    UserInactive: "user_inactive",
-    AssignmentAlreadyExists: "assignment_already_exists",
-    NoSeatsAvailable: "no_seats_available",
-}
-
-# Domain rules that block the goal: a run whose latest assignment attempt
-# one of them rejected, and whose goal does not hold, ends BLOCKED.
-_BLOCKING_ERRORS: dict[str, OutcomeReason] = {
-    "no_seats_available": OutcomeReason.NO_SEATS_AVAILABLE,
-    "user_inactive": OutcomeReason.USER_INACTIVE,
-}
 
 
 class AgentRunNotFound(Exception):
@@ -190,178 +163,6 @@ class RunNotExecutable(Exception):
 UNFINISHED_CALL = "a tool call has no recorded outcome"
 
 
-def tool_error(error: Exception, tool_name: str) -> ToolError:
-    """Normalize an exception raised while running a tool."""
-    if isinstance(error, DomainError):
-        # Domain messages are written for callers and safe to keep.
-        return ToolError(
-            code=_DOMAIN_ERROR_CODES.get(type(error), "domain_error"),
-            message=str(error),
-            error_type=type(error).__name__,
-        )
-    # Never str(error): SQLAlchemy errors include SQL and parameter values,
-    # and arbitrary exceptions may include anything.
-    return ToolError(
-        code=UNEXPECTED_ERROR,
-        message=f"Unexpected error while running {tool_name}.",
-        error_type=type(error).__name__,
-    )
-
-
-def _unexpected_detail(stage: str, error: Exception) -> dict[str, Any]:
-    return {"stage": stage, "error_type": type(error).__name__}
-
-
-def _persisted_goal(run: AgentRun) -> ResolvedAssignmentGoal:
-    if (
-        run.resolved_user_id is None
-        or run.resolved_licence_id is None
-        or run.extracted_user_email is None
-        or run.extracted_product is None
-    ):
-        raise RunNotExecutable(run.id, run.status)
-    return ResolvedAssignmentGoal(
-        user_id=run.resolved_user_id,
-        licence_id=run.resolved_licence_id,
-        extracted_user_email=run.extracted_user_email,
-        extracted_product=run.extracted_product,
-    )
-
-
-def _validated_request(instruction: str, requesting_actor: str) -> str:
-    """The normalized requesting actor, or raise InvalidInput."""
-    requesting_actor = validated_external_actor(requesting_actor)
-    if not instruction.strip():
-        raise InvalidInput("Instruction must not be empty.")
-    if len(instruction) > INSTRUCTION_MAX_LENGTH:
-        raise InvalidInput(
-            f"Instruction must be at most {INSTRUCTION_MAX_LENGTH} characters."
-        )
-    return requesting_actor
-
-
-def _require_awaiting_extraction(run: AgentRun) -> None:
-    if run.status is not AgentRunStatus.RECEIVED or run.goal_type is not None:
-        raise RunNotExecutable(run.id, run.status)
-
-
-class _ModelCallLog:
-    """The ModelCallRecorder handed to a planner: each record() is one short
-    log transaction, and the call takes the run's next sequence_no.
-
-    With ``max_requests``, before_request() enforces the stage's request
-    limit, counted from the requests already recorded for the run and stage
-    (retries and failed requests included). At the limit it ends the run
-    FAILED (step_limit) and raises DecisionStopped: the request is never
-    made.
-    """
-
-    def __init__(
-        self,
-        sessions: sessionmaker[Session],
-        run_id: int,
-        stage: ModelCallStage,
-        *,
-        max_requests: int | None = None,
-    ) -> None:
-        self._sessions = sessions
-        self._run_id = run_id
-        self._stage = stage
-        self._max_requests = max_requests
-
-    def before_request(self) -> None:
-        if self._max_requests is None:
-            return
-        with self._sessions.begin() as log:
-            made = ModelCallRepository(log).count_for_stage(self._run_id, self._stage)
-            if made < self._max_requests:
-                return
-            run = _get_run(log, self._run_id)
-            _end_at_limit(run, DecisionLimit.MODEL_REQUESTS, self._max_requests)
-        # Raised after the commit, so the run's outcome stays recorded.
-        raise DecisionStopped(self._run_id)
-
-    def record(self, call: ModelCallRecord) -> None:
-        with self._sessions.begin() as log:
-            ModelCallRepository(log).add(
-                ModelCall(
-                    agent_run_id=self._run_id,
-                    sequence_no=AgentRunRepository(log).next_sequence_no(self._run_id),
-                    stage=self._stage,
-                    model_name=call.model_name,
-                    status=(
-                        ModelCallStatus.SUCCEEDED
-                        if call.error is None
-                        else ModelCallStatus.FAILED
-                    ),
-                    input_tokens=call.input_tokens,
-                    output_tokens=call.output_tokens,
-                    latency_ms=call.latency_ms,
-                    output=call.output,
-                    error=(
-                        None
-                        if call.error is None
-                        else call.error.model_dump(mode="json")
-                    ),
-                )
-            )
-
-
-def _record_extraction(
-    run: AgentRun, instruction: str, outcome: ExtractedIntent | PlannerError
-) -> None:
-    """Store an assignment intent as the run's goal, or end the run."""
-    match outcome:
-        case EnsureAssignmentIntent():
-            # The planner is asked to copy text, but whatever it is, text that
-            # is not in the instruction was invented and is never resolved.
-            missing = ungrounded_fields(outcome, instruction)
-            if missing:
-                _end(
-                    run,
-                    AgentRunStatus.FAILED,
-                    reason=OutcomeReason.PLANNER_ERROR,
-                    detail={
-                        "stage": ModelCallStage.EXTRACTION.value,
-                        "code": "ungrounded_output",
-                        "error_type": None,
-                        "fields": missing,
-                    },
-                )
-                return
-            run.goal_type = GoalType.ENSURE_ASSIGNMENT
-            run.desired_state = DesiredState.ASSIGNED
-            run.extracted_user_email = outcome.user_email
-            run.extracted_product = outcome.product
-        case NeedsClarification():
-            _end(
-                run,
-                AgentRunStatus.NEEDS_CLARIFICATION,
-                reason=OutcomeReason.INSTRUCTION_UNCLEAR,
-                detail={"reason_code": outcome.reason_code},
-            )
-        case Unsupported():
-            _end(
-                run,
-                AgentRunStatus.NEEDS_CLARIFICATION,
-                reason=OutcomeReason.UNSUPPORTED_REQUEST,
-                detail={"reason_code": outcome.reason_code},
-            )
-        case PlannerError():
-            _end(
-                run,
-                AgentRunStatus.FAILED,
-                reason=OutcomeReason.PLANNER_ERROR,
-                detail={
-                    "stage": ModelCallStage.EXTRACTION.value,
-                    "code": outcome.code,
-                    "error_type": outcome.error_type,
-                },
-            )
-        case _:
-            assert_never(outcome)
-
-
 class AgentExecutor:
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         self._sessions = session_factory
@@ -384,6 +185,8 @@ class AgentExecutor:
         run_id = self.receive_run(
             instruction=instruction, requesting_actor=requesting_actor
         )
+        # Extraction adds a goal, not a status: a run it did not end is
+        # still RECEIVED.
         if self.extract_intent(run_id, intent_planner) is not AgentRunStatus.RECEIVED:
             return run_id
         if self.resolve_run(run_id) is not AgentRunStatus.RESOLVED:
@@ -455,14 +258,11 @@ class AgentExecutor:
         """
         with self._sessions() as log:
             run = _get_run(log, run_id)
-            if (
-                run.status is not AgentRunStatus.RECEIVED
-                or run.extracted_user_email is None
-                or run.extracted_product is None
-            ):
+            text = _extracted_text(run)
+            if run.status is not AgentRunStatus.RECEIVED or text is None:
                 # Not RECEIVED, or not extracted yet: there is nothing to resolve.
                 raise RunNotExecutable(run_id, run.status)
-            user_email, product = run.extracted_user_email, run.extracted_product
+            user_email, product = text
 
         resolution: ResolvedAssignmentGoal | ResolutionFailure
         try:
@@ -501,6 +301,20 @@ class AgentExecutor:
         MAX_DECISION_MODEL_REQUESTS; each tool it calls goes through
         call_tool. Nothing is read or attempted unless the model asks for it.
 
+        Control is inverted while the planner runs: the loop is PydanticAI's,
+        and it calls back into this executor.
+
+            decide -> planner.decide -> PydanticAI's agent loop
+              each model request -> CheckAndRecordModelRequests
+                  (app.agent.model_requests), which calls
+                  calls.before_request (the limit) and calls.record
+              each tool the model calls -> its tool function
+                  (app.agent.pydantic_ai_decision) -> ctx.deps(tool),
+                  the callback passed below -> self.call_tool(run_id, tool)
+
+        So every request and tool call comes back through this class, which
+        can end or pause the run and stop the loop with DecisionStopped.
+
         When the model concludes, its proposal is recorded and the run ends
         as decision_outcome says: the verifier and the application's own
         checks decide, never the proposal. A PlannerError ends the run FAILED
@@ -526,12 +340,7 @@ class AgentExecutor:
 
         # No session is open while the planner runs; each request and each
         # tool call opens and closes its own.
-        calls = _ModelCallLog(
-            self._sessions,
-            run_id,
-            ModelCallStage.DECISION,
-            max_requests=MAX_DECISION_MODEL_REQUESTS,
-        )
+        calls = _DecisionModelCallLog(self._sessions, run_id)
         try:
             proposal = planner.decide(
                 context, lambda tool: self.call_tool(run_id, tool), calls
@@ -670,7 +479,7 @@ class AgentExecutor:
                 )
         except Exception as error:
             # Also reached if the commit fails after the tool returned.
-            outcome = tool_error(error, tools.RECORDED_NAMES[tool])
+            outcome = tools.tool_error(error, tools.RECORDED_NAMES[tool])
 
         # LOG: record what happened, and end the run if the model cannot be
         # shown it.
@@ -768,6 +577,16 @@ class AgentExecutor:
             return run.status
 
 
+# --- used by every step -------------------------------------------------------
+
+
+def _get_run(session: Session, run_id: int) -> AgentRun:
+    run = AgentRunRepository(session).get(run_id)
+    if run is None:
+        raise AgentRunNotFound(run_id)
+    return run
+
+
 def _end(
     run: AgentRun,
     status: AgentRunStatus,
@@ -786,11 +605,193 @@ def _end(
     run.completed_at = utcnow()
 
 
-def _get_run(session: Session, run_id: int) -> AgentRun:
-    run = AgentRunRepository(session).get(run_id)
-    if run is None:
-        raise AgentRunNotFound(run_id)
-    return run
+def _unexpected_detail(stage: str, error: Exception) -> dict[str, Any]:
+    return {"stage": stage, "error_type": type(error).__name__}
+
+
+# --- receive, extract, resolve ------------------------------------------------
+
+
+def _validated_request(instruction: str, requesting_actor: str) -> str:
+    """The normalized requesting actor, or raise InvalidInput."""
+    requesting_actor = validated_external_actor(requesting_actor)
+    if not instruction.strip():
+        raise InvalidInput("Instruction must not be empty.")
+    if len(instruction) > INSTRUCTION_MAX_LENGTH:
+        raise InvalidInput(
+            f"Instruction must be at most {INSTRUCTION_MAX_LENGTH} characters."
+        )
+    return requesting_actor
+
+
+def _extracted_text(run: AgentRun) -> tuple[str, str] | None:
+    """The user email and product extraction stored on the run, or None if
+    it has stored no goal: the one test of whether a run is extracted. A
+    goal's columns are written together or not at all (CHECK
+    goal_columns_together), so these two answer for all of them."""
+    if run.extracted_user_email is None or run.extracted_product is None:
+        return None
+    return run.extracted_user_email, run.extracted_product
+
+
+def _require_awaiting_extraction(run: AgentRun) -> None:
+    if run.status is not AgentRunStatus.RECEIVED or _extracted_text(run) is not None:
+        raise RunNotExecutable(run.id, run.status)
+
+
+class _ModelCallLog:
+    """The ModelCallRecorder handed to a planner: each record() is one short
+    log transaction, and the call takes the run's next sequence_no."""
+
+    def __init__(
+        self, sessions: sessionmaker[Session], run_id: int, stage: ModelCallStage
+    ) -> None:
+        self._sessions = sessions
+        self._run_id = run_id
+        self._stage = stage
+
+    def record(self, call: ModelCallRecord) -> None:
+        with self._sessions.begin() as log:
+            ModelCallRepository(log).add(
+                ModelCall(
+                    agent_run_id=self._run_id,
+                    sequence_no=AgentRunRepository(log).next_sequence_no(self._run_id),
+                    stage=self._stage,
+                    model_name=call.model_name,
+                    status=(
+                        ModelCallStatus.SUCCEEDED
+                        if call.error is None
+                        else ModelCallStatus.FAILED
+                    ),
+                    input_tokens=call.input_tokens,
+                    output_tokens=call.output_tokens,
+                    latency_ms=call.latency_ms,
+                    output=call.output,
+                    error=(
+                        None
+                        if call.error is None
+                        else call.error.model_dump(mode="json")
+                    ),
+                )
+            )
+
+
+def _record_extraction(
+    run: AgentRun, instruction: str, outcome: ExtractedIntent | PlannerError
+) -> None:
+    """Store an assignment intent as the run's goal, or end the run."""
+    match outcome:
+        case EnsureAssignmentIntent():
+            # The planner is asked to copy text, but whatever it is, text that
+            # is not in the instruction was invented and is never resolved.
+            missing = ungrounded_fields(outcome, instruction)
+            if missing:
+                _end(
+                    run,
+                    AgentRunStatus.FAILED,
+                    reason=OutcomeReason.PLANNER_ERROR,
+                    detail={
+                        "stage": ModelCallStage.EXTRACTION.value,
+                        "code": "ungrounded_output",
+                        "error_type": None,
+                        "fields": missing,
+                    },
+                )
+                return
+            run.goal_type = GoalType.ENSURE_ASSIGNMENT
+            run.desired_state = DesiredState.ASSIGNED
+            run.extracted_user_email = outcome.user_email
+            run.extracted_product = outcome.product
+        case NeedsClarification():
+            _end(
+                run,
+                AgentRunStatus.NEEDS_CLARIFICATION,
+                reason=OutcomeReason.INSTRUCTION_UNCLEAR,
+                detail={"reason_code": outcome.reason_code},
+            )
+        case Unsupported():
+            _end(
+                run,
+                AgentRunStatus.NEEDS_CLARIFICATION,
+                reason=OutcomeReason.UNSUPPORTED_REQUEST,
+                detail={"reason_code": outcome.reason_code},
+            )
+        case PlannerError():
+            _end(
+                run,
+                AgentRunStatus.FAILED,
+                reason=OutcomeReason.PLANNER_ERROR,
+                detail={
+                    "stage": ModelCallStage.EXTRACTION.value,
+                    "code": outcome.code,
+                    "error_type": outcome.error_type,
+                },
+            )
+        case _:
+            assert_never(outcome)
+
+
+# --- decide -------------------------------------------------------------------
+
+
+def _persisted_goal(run: AgentRun) -> ResolvedAssignmentGoal:
+    text = _extracted_text(run)
+    if text is None or run.resolved_user_id is None or run.resolved_licence_id is None:
+        raise RunNotExecutable(run.id, run.status)
+    user_email, product = text
+    return ResolvedAssignmentGoal(
+        user_id=run.resolved_user_id,
+        licence_id=run.resolved_licence_id,
+        extracted_user_email=user_email,
+        extracted_product=product,
+    )
+
+
+class _DecisionModelCallLog(_ModelCallLog):
+    """The decision stage's recorder. before_request() enforces
+    MAX_DECISION_MODEL_REQUESTS, counted from the decision requests already
+    recorded for the run (retries and failed requests included). At the
+    limit it ends the run FAILED (step_limit) and raises DecisionStopped:
+    the request is never made.
+
+    Extraction has no such check: its retry budget bounds it
+    (app.agent.pydantic_ai_planner).
+    """
+
+    def __init__(self, sessions: sessionmaker[Session], run_id: int) -> None:
+        super().__init__(sessions, run_id, ModelCallStage.DECISION)
+
+    def before_request(self) -> None:
+        with self._sessions.begin() as log:
+            made = ModelCallRepository(log).count_for_stage(self._run_id, self._stage)
+            if made < MAX_DECISION_MODEL_REQUESTS:
+                return
+            run = _get_run(log, self._run_id)
+            _end_at_limit(
+                run, DecisionLimit.MODEL_REQUESTS, MAX_DECISION_MODEL_REQUESTS
+            )
+        # Raised after the commit, so the run's outcome stays recorded.
+        raise DecisionStopped(self._run_id)
+
+
+def _end_at_limit(run: AgentRun, limit: DecisionLimit, maximum: int) -> None:
+    _end(
+        run,
+        AgentRunStatus.FAILED,
+        reason=OutcomeReason.STEP_LIMIT,
+        detail={"limit": limit.value, "maximum": maximum},
+    )
+
+
+def _blocking_rejection(attempt: ToolCall | None) -> OutcomeReason | None:
+    """The BLOCKED reason if a run's latest mutation attempt was rejected by
+    a blocking domain rule (tools.DOMAIN_RULES). Read from the error code
+    recorded from the typed domain error, never from a message."""
+    if attempt is None or attempt.status is not ToolCallStatus.FAILED:
+        return None
+    if attempt.error is None:
+        return None
+    return tools.blocking_reason(attempt.error["code"])
 
 
 def _call_detail(call: ToolCall) -> dict[str, Any]:
@@ -802,6 +803,9 @@ def _call_detail(call: ToolCall) -> dict[str, Any]:
         "tool_name": call.tool_name,
         "error": call.error,
     }
+
+
+# --- admitting a tool call ----------------------------------------------------
 
 
 def _exceeded_limit(
@@ -819,15 +823,6 @@ def _exceeded_limit(
     if calls.count_for_tools(run_id, kind) >= maximum:
         return limit, maximum
     return None
-
-
-def _end_at_limit(run: AgentRun, limit: DecisionLimit, maximum: int) -> None:
-    _end(
-        run,
-        AgentRunStatus.FAILED,
-        reason=OutcomeReason.STEP_LIMIT,
-        detail={"limit": limit.value, "maximum": maximum},
-    )
 
 
 def _refuse_over_limit(
@@ -878,14 +873,3 @@ def _hold_for_approval(
     call.status = ToolCallStatus.AWAITING_APPROVAL
     calls.add(call)
     run.status = AgentRunStatus.AWAITING_APPROVAL
-
-
-def _blocking_rejection(attempt: ToolCall | None) -> OutcomeReason | None:
-    """The BLOCKED reason if a run's latest mutation attempt was rejected by
-    a blocking domain rule. Read from the error code the executor recorded
-    from the typed domain error, never from a message."""
-    if attempt is None or attempt.status is not ToolCallStatus.FAILED:
-        return None
-    if attempt.error is None:
-        return None
-    return _BLOCKING_ERRORS.get(attempt.error["code"])

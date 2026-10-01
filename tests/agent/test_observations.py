@@ -11,8 +11,7 @@ from typing import Any, get_args
 import pytest
 from pydantic import BaseModel, ValidationError
 
-from app.agent.executor import tool_error
-from app.agent.tools import REJECTION_CODES, observe, serialize
+from app.agent.tools import DOMAIN_RULES, observe, serialize, tool_error
 from app.models import UserStatus
 from app.schemas.agent import (
     AssignmentAttemptObservation,
@@ -31,6 +30,7 @@ from app.schemas.agent import (
 )
 from app.services.errors import (
     AssignmentAlreadyExists,
+    InvalidInput,
     LicenceNotFound,
     NoSeatsAvailable,
     UserInactive,
@@ -178,11 +178,17 @@ def test_a_domain_rejection_is_observed_by_code_never_by_message(
     assert_id_free(text)
 
 
-def test_the_rejections_a_model_may_see_are_exactly_the_domain_rules() -> None:
-    assert REJECTION_CODES == {
-        "no_seats_available": "no_seats_available",
-        "user_inactive": "user_inactive",
-        "assignment_already_exists": "already_assigned",
+def test_each_domain_error_keeps_its_recorded_and_shown_code() -> None:
+    # Recorded codes are persisted and public; shown codes are the only
+    # rejections a model may see.
+    codes = {error: (rule.code, rule.shown_as) for error, rule in DOMAIN_RULES.items()}
+    assert codes == {
+        InvalidInput: ("invalid_input", None),
+        UserNotFound: ("user_not_found", None),
+        LicenceNotFound: ("licence_not_found", None),
+        AssignmentAlreadyExists: ("assignment_already_exists", "already_assigned"),
+        NoSeatsAvailable: ("no_seats_available", "no_seats_available"),
+        UserInactive: ("user_inactive", "user_inactive"),
     }
 
 

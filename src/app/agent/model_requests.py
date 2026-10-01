@@ -22,7 +22,6 @@ from pydantic_ai import (
     ModelRetry,
     RunContext,
     UnexpectedModelBehavior,
-    UsageLimitExceeded,
     UserError,
 )
 from pydantic_ai.capabilities import AbstractCapability, WrapModelRequestHandler
@@ -89,8 +88,6 @@ def as_planner_error(error: Exception) -> PlannerError | None:
     if isinstance(error, UnexpectedModelBehavior):
         # The retry budget ran out without an acceptable response.
         return PlannerError("output_retries_exhausted", type(error).__name__)
-    if isinstance(error, UsageLimitExceeded):
-        return PlannerError("request_limit_exceeded", type(error).__name__)
     if isinstance(error, UserError):
         # e.g. no API key for the configured provider; no request was made.
         return PlannerError("configuration_error", type(error).__name__)

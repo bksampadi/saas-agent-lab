@@ -14,7 +14,8 @@ what the application fixes around that choice:
 import json
 from enum import StrEnum
 
-from app.models import AgentRunStatus, CannotProceedReason, GoalType, OutcomeReason
+from app.agent import tools
+from app.models import AgentRunStatus, GoalType, OutcomeReason
 from app.schemas.agent import (
     CannotProceed,
     DecisionContext,
@@ -105,11 +106,6 @@ def decision_context(user_email: str, product: str) -> DecisionContext:
 
 # --- the run's outcome --------------------------------------------------------
 
-_CONFIRMED_BLOCKS: dict[CannotProceedReason, OutcomeReason] = {
-    CannotProceedReason.NO_SEATS_AVAILABLE: OutcomeReason.NO_SEATS_AVAILABLE,
-    CannotProceedReason.USER_INACTIVE: OutcomeReason.USER_INACTIVE,
-}
-
 
 def decision_outcome(
     *,
@@ -142,5 +138,5 @@ def decision_outcome(
     if rejection is not None:
         return AgentRunStatus.BLOCKED, rejection
     if isinstance(proposal, CannotProceed) and claim_confirmed:
-        return AgentRunStatus.BLOCKED, _CONFIRMED_BLOCKS[proposal.reason_code]
+        return AgentRunStatus.BLOCKED, tools.BLOCKS_BY_CLAIM[proposal.reason_code]
     return AgentRunStatus.FAILED, OutcomeReason.VERIFICATION_FAILED

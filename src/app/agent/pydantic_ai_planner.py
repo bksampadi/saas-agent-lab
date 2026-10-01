@@ -7,6 +7,11 @@ member of ExtractedIntent. Every response is checked by the application
 rejected or failed, is recorded through the run's ModelCallRecorder as soon
 as it has an outcome (app.agent.model_requests). A rejected response is sent
 back to the model with the reason, at most OUTPUT_RETRIES times.
+
+That retry budget is also extraction's request limit: the model has no
+function tools, so every request after the first answers a rejected
+response, and one plan makes at most 1 + OUTPUT_RETRIES requests. Unlike
+the decision stage, nothing counts recorded requests before each one.
 """
 
 import time
@@ -18,7 +23,6 @@ from pydantic_ai.messages import ModelResponse, ToolCallPart
 from pydantic_ai.models import Model
 from pydantic_ai.output import ToolOutput
 from pydantic_ai.settings import ModelSettings
-from pydantic_ai.usage import UsageLimits
 
 from app.agent.model_requests import (
     CheckAndRecordModelRequests,
@@ -35,9 +39,8 @@ from app.schemas.agent import (
 )
 
 # Rejected responses answered with feedback before planning gives up. Every
-# retry is another model request, so one plan makes at most MAX_REQUESTS.
+# retry is another model request, so one plan makes at most 1 + OUTPUT_RETRIES.
 OUTPUT_RETRIES = 2
-MAX_REQUESTS = 1 + OUTPUT_RETRIES
 MAX_OUTPUT_TOKENS = 4096
 
 # The result tools the model may call, by the name it sees.
@@ -154,11 +157,7 @@ class PydanticAIIntentPlanner:
             clock=self._clock,
         )
         try:
-            result = self._agent.run_sync(
-                instruction,
-                capabilities=[checker],
-                usage_limits=UsageLimits(request_limit=MAX_REQUESTS),
-            )
+            result = self._agent.run_sync(instruction, capabilities=[checker])
         except Exception as error:
             planner_error = as_planner_error(error)
             if planner_error is None:

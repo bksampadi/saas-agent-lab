@@ -27,7 +27,6 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.agent.executor import AgentExecutor
 from app.agent.planner import PlannerError
 from app.agent.pydantic_ai_planner import (
-    MAX_REQUESTS,
     OUTPUT_RETRIES,
     PydanticAIIntentPlanner,
 )
@@ -54,6 +53,8 @@ from support import HUMAN, MODEL, Script, count, get_run, model_calls
 # The declared default, not whatever a developer's .env or environment sets.
 DEFAULT_MODEL = Settings.model_fields["planner_model"].default
 Sessions = sessionmaker[Session]
+# Every request after the first is an output retry.
+MAX_REQUESTS = 1 + OUTPUT_RETRIES
 
 
 # --- helpers ------------------------------------------------------------------
@@ -329,7 +330,6 @@ def test_output_retries_are_bounded_then_planning_fails() -> None:
         planner(script).plan("Give ada@example.com Figma.", calls)
 
     assert raised.value.code == "output_retries_exhausted"
-    assert MAX_REQUESTS == 1 + OUTPUT_RETRIES
     assert len(script.requests) == MAX_REQUESTS
     assert [call.error and call.error.code for call in calls.calls] == [
         "invalid_output"
