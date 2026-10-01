@@ -20,7 +20,8 @@ from sqlalchemy.orm import Session, sessionmaker
 
 import app.agent.executor as executor_module
 from app.agent import tools
-from app.agent.executor import AgentExecutor, RunNotExecutable, UnfinishedToolCall
+from app.agent.decision import DecisionStopped
+from app.agent.executor import AgentExecutor, RunNotExecutable
 from app.agent.planner import CallTool, DecisionModelCallRecorder
 from app.models import (
     AgentRun,
@@ -29,6 +30,7 @@ from app.models import (
     AuditEvent,
     Licence,
     OutcomeReason,
+    PolicyDecision,
     ToolCall,
     ToolCallStatus,
     User,
@@ -43,6 +45,7 @@ from app.schemas.agent import (
     DecisionProposal,
     GoalReached,
     LicenceSnapshot,
+    ModelCallRecord,
     ResolvedAssignmentGoal,
     TargetToolName,
     ToolError,
@@ -650,6 +653,45 @@ def test_execution_and_verification_use_the_persisted_ids_not_the_text(
     ]
 
 
+# --- an ended run stays ended ----------------------------------------------------
+
+
+def test_a_planner_that_ignores_a_stop_cannot_change_how_the_run_ended(
+    executor: AgentExecutor, session_factory: Sessions, seed: Seed
+) -> None:
+    add(
+        session_factory,
+        Licence(product="Zoom", seats_total=5, agent_policy=PolicyDecision.DENY),
+    )
+    run_id = resolved_run(executor, product="Zoom")
+    request = ModelCallRecord(
+        model_name="fake-model",
+        input_tokens=1,
+        output_tokens=1,
+        latency_ms=1,
+        output={"kind": "tool_calls", "tool_names": []},
+        error=None,
+    )
+
+    def ignore_the_stop(
+        context: DecisionContext, call_tool: CallTool, calls: DecisionModelCallRecorder
+    ) -> DecisionProposal:
+        with contextlib.suppress(DecisionStopped):
+            call_tool(ASSIGN)  # denied: the run ends BLOCKED
+        while True:  # and carries on until the request limit
+            calls.before_request()
+            calls.record(request)
+
+    status = executor.decide(run_id, FakeDecisionPlanner(ignore_the_stop))
+
+    # The limit it then reached does not overwrite the run's outcome.
+    assert status is S.BLOCKED
+    run = get_run(session_factory, run_id)
+    assert (run.status, run.outcome_reason) == (S.BLOCKED, R.POLICY_DENIED)
+    assert run.outcome_detail is not None
+    assert run.outcome_detail["error"]["code"] == "policy_denied"
+
+
 # --- crash windows: the state each leaves (documented, not recovered) ---------
 
 
@@ -696,14 +738,14 @@ def test_a_planner_that_carries_on_after_a_crashed_call_cannot_call_or_conclude(
             patch.setattr(tools, "run", crash)
             with contextlib.suppress(Crash):  # the planner swallows the crash
                 call_tool(ASSIGN)
-        with pytest.raises(UnfinishedToolCall):
+        with pytest.raises(RunNotExecutable, match="no recorded outcome"):
             call_tool(USER)
         refused.append("tool call")
         return GoalReached()
 
     # Whether the crashed call made its change is unknown, so the run is
     # neither carried on nor verified and labelled.
-    with pytest.raises(UnfinishedToolCall):
+    with pytest.raises(RunNotExecutable, match="no recorded outcome"):
         executor.decide(run_id, FakeDecisionPlanner(carry_on))
 
     assert refused == ["tool call"]

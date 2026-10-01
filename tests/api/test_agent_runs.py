@@ -58,7 +58,6 @@ from app.models import (
     Assignment,
     AuditEvent,
     Base,
-    GoalType,
     Licence,
     PolicyDecision,
     ToolCall,
@@ -66,7 +65,6 @@ from app.models import (
     UserStatus,
 )
 from app.repositories.tool_calls import ToolCallRepository
-from app.schemas.agent import DecisionTask
 
 HUMAN = "requesting-user@example.com"
 MODEL = "scripted-model"
@@ -700,11 +698,7 @@ def test_get_returns_the_persisted_trace_in_order_as_the_model_saw_it(
             "instructions": api.decision.infos[0].instructions,
             "prompt": prompt.content,
         }
-        == decision_context(
-            DecisionTask(
-                goal_type=GoalType.ENSURE_ASSIGNMENT, user_email=EMAIL, product=PRODUCT
-            )
-        ).model_dump()
+        == decision_context(EMAIL, PRODUCT).model_dump()
     )
     # The rejection blocked the run, and the claim was confirmed as well.
     assert detail["verification"] == {

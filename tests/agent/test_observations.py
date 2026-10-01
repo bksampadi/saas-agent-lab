@@ -13,7 +13,7 @@ from pydantic import BaseModel, ValidationError
 
 from app.agent.executor import tool_error
 from app.agent.tools import REJECTION_CODES, observe, serialize
-from app.models import DesiredState, GoalType, UserStatus
+from app.models import UserStatus
 from app.schemas.agent import (
     AssignmentAttemptObservation,
     AssignmentSnapshot,
@@ -46,8 +46,6 @@ IDS = [str(n) for n in (ADA, FIGMA, SLACK, ASSIGNMENT)]
 NOW = datetime(2026, 9, 27, 12, 0, tzinfo=UTC)
 
 GOAL = ResolvedAssignmentGoal(
-    goal_type=GoalType.ENSURE_ASSIGNMENT,
-    desired_state=DesiredState.ASSIGNED,
     user_id=ADA,
     licence_id=FIGMA,
     extracted_user_email="ada@example.com",

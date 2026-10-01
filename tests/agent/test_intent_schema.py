@@ -9,6 +9,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from app.agent.pydantic_ai_planner import OUTPUT_TOOLS
 from app.schemas.agent import (
+    EXTRACTED_TEXT_MAX_LENGTH,
     EnsureAssignmentIntent,
     ExtractedIntent,
     NeedsClarification,
@@ -43,6 +44,15 @@ def test_no_shape_has_an_id_or_free_form_field(shape: type[Any]) -> None:
         assert not ID_LIKE.search(name), name
         # Strings and closed sets only: nothing that could carry a structure.
         assert field.get("type") == "string", (name, field)
+
+
+@pytest.mark.parametrize("field", ["user_email", "product"])
+def test_an_assignment_rejects_text_beyond_the_storage_bound(field: str) -> None:
+    values = {"user_email": "ada@example.com", "product": "Figma"}
+    values[field] = "x" * (EXTRACTED_TEXT_MAX_LENGTH + 1)
+
+    with pytest.raises(ValidationError, match="string_too_long|at most"):
+        EnsureAssignmentIntent.model_validate(values)
 
 
 def test_the_fields_are_exactly_the_contract() -> None:

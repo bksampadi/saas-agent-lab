@@ -15,21 +15,17 @@ from app.agent.decision import (
     MAX_DECISION_READ_CALLS,
     decision_context,
     decision_outcome,
-    decision_task,
 )
 from app.agent.pydantic_ai_decision import PROPOSAL_TOOLS, TARGET_TOOLS
 from app.models import (
     AgentRunStatus,
     CannotProceedReason,
     DecisionProposalKind,
-    DesiredState,
-    GoalType,
     OutcomeReason,
 )
 from app.schemas.agent import (
     CannotProceed,
     DecisionProposal,
-    DecisionTask,
     GoalReached,
     NoActionNeeded,
     ResolvedAssignmentGoal,
@@ -185,8 +181,6 @@ def test_no_proposal_ever_makes_an_unsatisfied_goal_completed() -> None:
 # --- what the model is told -----------------------------------------------------
 
 GOAL = ResolvedAssignmentGoal(
-    goal_type=GoalType.ENSURE_ASSIGNMENT,
-    desired_state=DesiredState.ASSIGNED,
     user_id=48213,
     licence_id=97531,
     extracted_user_email="Ada@Example.com",
@@ -194,21 +188,18 @@ GOAL = ResolvedAssignmentGoal(
 )
 
 
-def test_the_task_holds_the_extracted_text_and_no_ids() -> None:
-    task = decision_task(GOAL)
-
-    assert task == DecisionTask(
-        goal_type=GoalType.ENSURE_ASSIGNMENT,
-        user_email="Ada@Example.com",
-        product="figma",
-    )
-    assert set(DecisionTask.model_fields) == {"goal_type", "user_email", "product"}
+def test_the_context_is_built_from_the_goals_text_alone() -> None:
+    # It is never handed an id, so it cannot pass one on.
+    assert list(inspect.signature(decision_context).parameters) == [
+        "user_email",
+        "product",
+    ]
 
 
-def test_the_context_is_deterministic_and_id_free() -> None:
-    context = decision_context(decision_task(GOAL))
+def test_the_context_is_deterministic() -> None:
+    context = decision_context("Ada@Example.com", "figma")
 
-    assert context == decision_context(decision_task(GOAL))
+    assert context == decision_context("Ada@Example.com", "figma")
     assert context.instructions == DECISION_INSTRUCTIONS
     assert context.prompt == (
         "The goal:\n"
@@ -220,8 +211,6 @@ def test_the_context_is_deterministic_and_id_free() -> None:
             }
         )
     )
-    for row_id in ("48213", "97531"):
-        assert row_id not in context.instructions + context.prompt
 
 
 def test_the_instructions_are_sent_as_written() -> None:

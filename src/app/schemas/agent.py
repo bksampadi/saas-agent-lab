@@ -18,8 +18,6 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_vali
 from app.models import (
     Assignment,
     CannotProceedReason,
-    DesiredState,
-    GoalType,
     OutcomeReason,
     User,
     UserStatus,
@@ -124,28 +122,13 @@ class ModelCallRecord(BaseModel):
 # --- resolution ---------------------------------------------------------------
 
 
-class ExtractedAssignmentIntent(BaseModel):
-    """Text extracted from an instruction, before any identity is known.
-
-    Text only: there are deliberately no id fields, and extra="forbid" rejects
-    any that are supplied, so which rows a run acts on is decided by the
-    resolver alone. Content is checked by the resolver (invalid_input).
-    """
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    user_email: ExtractedText
-    product: ExtractedText
-
-
 class ResolvedAssignmentGoal(BaseModel):
     """The contract a run executes and is verified against, as persisted on
-    the AgentRun. Built only by the resolver or loaded from the run."""
+    the AgentRun: that this user holds an active seat of this licence. Built
+    only by the resolver or loaded from the run."""
 
     model_config = ConfigDict(frozen=True)
 
-    goal_type: GoalType
-    desired_state: DesiredState
     user_id: int
     licence_id: int
     extracted_user_email: str
@@ -258,8 +241,6 @@ class ToolError(BaseModel):
 class VerificationEvidence(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    goal_type: GoalType
-    desired_state: DesiredState
     user_id: int
     licence_id: int
     active_assignment: AssignmentSnapshot | None
@@ -363,17 +344,6 @@ TargetToolName = Literal[
     "list_target_user_assignments",
     "assign_target_licence",
 ]
-
-
-class DecisionTask(BaseModel):
-    """The goal as the decision model is told it: the semantic values
-    persisted on the run when its intent was extracted, never resolved ids."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    goal_type: GoalType
-    user_email: str
-    product: str
 
 
 class DecisionContext(BaseModel):

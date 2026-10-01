@@ -64,8 +64,8 @@ change is still traceable to the run through its audit actor
 "agent:run-<id>". The crash ends the decision loop, leaving the run
 EXECUTING, and nothing decides it again. Should a planner carry on anyway,
 a run with a STARTED call refuses further tool calls and verification
-(UnfinishedToolCall), so it is never labelled without knowing whether it
-made a change. A paused run's held call stays AWAITING_APPROVAL; nothing
+(RunNotExecutable), so it is never labelled without knowing whether it made
+a change. A paused run's held call stays AWAITING_APPROVAL; nothing
 resumes it yet.
 
 Tool calls within a run are serial. Nothing here coordinates concurrent
@@ -86,7 +86,6 @@ from app.agent.decision import (
     DecisionStopped,
     decision_context,
     decision_outcome,
-    decision_task,
 )
 from app.agent.planner import (
     DecisionPlanner,
@@ -95,7 +94,6 @@ from app.agent.planner import (
     ungrounded_fields,
 )
 from app.agent.resolver import resolve_assignment_goal
-from app.agent.status import transition
 from app.agent.verifier import check_block, verify
 from app.models import (
     AgentRun,
@@ -120,7 +118,6 @@ from app.schemas.agent import (
     CannotProceed,
     DecisionProposal,
     EnsureAssignmentIntent,
-    ExtractedAssignmentIntent,
     ExtractedIntent,
     ModelCallRecord,
     NeedsClarification,
@@ -177,30 +174,20 @@ class AgentRunNotFound(Exception):
 
 
 class RunNotExecutable(Exception):
-    """The run's status does not allow the step. Nothing was recorded."""
+    """The run's state does not allow the step. Nothing was recorded."""
 
-    def __init__(self, run_id: int, status: AgentRunStatus) -> None:
-        super().__init__(f"Agent run {run_id} is {status}; it cannot do this now.")
+    def __init__(
+        self, run_id: int, status: AgentRunStatus, why: str = "it cannot do this now"
+    ) -> None:
+        super().__init__(f"Agent run {run_id} is {status}; {why}.")
         self.run_id = run_id
         self.status = status
 
 
-class UnfinishedToolCall(RunNotExecutable):
-    """The run has a tool call with no recorded outcome (a crash window).
-
-    Its change may or may not have committed, so the run must not carry on
-    (or be verified and labelled) until that is reconciled. Recovery is not
-    implemented; this only refuses to continue.
-    """
-
-    def __init__(self, run_id: int, status: AgentRunStatus) -> None:
-        Exception.__init__(
-            self,
-            f"Agent run {run_id} has a tool call with no recorded outcome; "
-            "it must be reconciled before the run can continue.",
-        )
-        self.run_id = run_id
-        self.status = status
+# A tool call with no recorded outcome (a crash window): its change may or
+# may not have committed, so the run must not carry on, or be verified and
+# labelled, until that is reconciled. Recovery is not implemented.
+UNFINISHED_CALL = "a tool call has no recorded outcome"
 
 
 def tool_error(error: Exception, tool_name: str) -> ToolError:
@@ -229,15 +216,11 @@ def _persisted_goal(run: AgentRun) -> ResolvedAssignmentGoal:
     if (
         run.resolved_user_id is None
         or run.resolved_licence_id is None
-        or run.goal_type is None
-        or run.desired_state is None
         or run.extracted_user_email is None
         or run.extracted_product is None
     ):
         raise RunNotExecutable(run.id, run.status)
     return ResolvedAssignmentGoal(
-        goal_type=run.goal_type,
-        desired_state=run.desired_state,
         user_id=run.resolved_user_id,
         licence_id=run.resolved_licence_id,
         extracted_user_email=run.extracted_user_email,
@@ -335,7 +318,7 @@ def _record_extraction(
             # is not in the instruction was invented and is never resolved.
             missing = ungrounded_fields(outcome, instruction)
             if missing:
-                transition(
+                _end(
                     run,
                     AgentRunStatus.FAILED,
                     reason=OutcomeReason.PLANNER_ERROR,
@@ -352,21 +335,21 @@ def _record_extraction(
             run.extracted_user_email = outcome.user_email
             run.extracted_product = outcome.product
         case NeedsClarification():
-            transition(
+            _end(
                 run,
                 AgentRunStatus.NEEDS_CLARIFICATION,
                 reason=OutcomeReason.INSTRUCTION_UNCLEAR,
                 detail={"reason_code": outcome.reason_code},
             )
         case Unsupported():
-            transition(
+            _end(
                 run,
                 AgentRunStatus.NEEDS_CLARIFICATION,
                 reason=OutcomeReason.UNSUPPORTED_REQUEST,
                 detail={"reason_code": outcome.reason_code},
             )
         case PlannerError():
-            transition(
+            _end(
                 run,
                 AgentRunStatus.FAILED,
                 reason=OutcomeReason.PLANNER_ERROR,
@@ -480,15 +463,13 @@ class AgentExecutor:
             ):
                 # Not RECEIVED, or not extracted yet: there is nothing to resolve.
                 raise RunNotExecutable(run_id, run.status)
-            intent = ExtractedAssignmentIntent(
-                user_email=run.extracted_user_email, product=run.extracted_product
-            )
+            user_email, product = run.extracted_user_email, run.extracted_product
 
         resolution: ResolvedAssignmentGoal | ResolutionFailure
         try:
             with self._sessions() as read:
                 resolution = resolve_assignment_goal(
-                    UserService(read), LicenceService(read), intent
+                    UserService(read), LicenceService(read), user_email, product
                 )
         except Exception as error:
             return self._fail(run_id, _unexpected_detail("resolution", error))
@@ -496,7 +477,7 @@ class AgentExecutor:
         with self._sessions.begin() as log:
             run = _get_run(log, run_id)
             if isinstance(resolution, ResolutionFailure):
-                transition(
+                _end(
                     run,
                     AgentRunStatus.NEEDS_CLARIFICATION,
                     reason=resolution.code,
@@ -505,7 +486,7 @@ class AgentExecutor:
             else:
                 run.resolved_user_id = resolution.user_id
                 run.resolved_licence_id = resolution.licence_id
-                transition(run, AgentRunStatus.RESOLVED)
+                run.status = AgentRunStatus.RESOLVED
             return run.status
 
     # --- decision ---------------------------------------------------------------
@@ -538,9 +519,11 @@ class AgentExecutor:
             if run.status is not AgentRunStatus.RESOLVED:
                 raise RunNotExecutable(run_id, run.status)
             goal = _persisted_goal(run)
-            context = decision_context(decision_task(goal))
+            context = decision_context(
+                goal.extracted_user_email, goal.extracted_product
+            )
             run.decision_context = context.model_dump(mode="json")
-            transition(run, AgentRunStatus.EXECUTING)
+            run.status = AgentRunStatus.EXECUTING
 
         # No session is open while the planner runs; each request and each
         # tool call opens and closes its own.
@@ -587,11 +570,11 @@ class AgentExecutor:
                 raise RunNotExecutable(run_id, run.status)
             calls = ToolCallRepository(log)
             if calls.any_started(run.id):
-                raise UnfinishedToolCall(run_id, run.status)
+                raise RunNotExecutable(run_id, run.status, UNFINISHED_CALL)
             run.decision_proposal = DecisionProposalKind(proposal.kind)
             if isinstance(proposal, CannotProceed):
                 run.decision_reason_code = proposal.reason_code
-            transition(run, AgentRunStatus.VERIFYING)
+            run.status = AgentRunStatus.VERIFYING
             goal = _persisted_goal(run)
             changed = calls.any_succeeded(run.id, tools.RECORDED_MUTATIONS)
             attempt = calls.latest_for_tools(run.id, tools.RECORDED_MUTATIONS)
@@ -627,7 +610,7 @@ class AgentExecutor:
         )
         with self._sessions.begin() as log:
             run = _get_run(log, run_id)
-            transition(
+            _end(
                 run,
                 status,
                 reason=reason,
@@ -651,7 +634,7 @@ class AgentExecutor:
             run = _get_run(log, run_id)
             # A tool call may have ended the run already; that outcome stands.
             if run.status is AgentRunStatus.EXECUTING:
-                transition(run, AgentRunStatus.FAILED, reason=reason, detail=detail)
+                _end(run, AgentRunStatus.FAILED, reason=reason, detail=detail)
             return run.status
 
     # --- tool calls -------------------------------------------------------------
@@ -705,7 +688,7 @@ class AgentExecutor:
                 call.status = ToolCallStatus.FAILED
                 call.error = outcome.model_dump(mode="json")
                 if observation is None:
-                    transition(
+                    _end(
                         run,
                         AgentRunStatus.FAILED,
                         reason=OutcomeReason.TOOL_FAILED,
@@ -743,7 +726,7 @@ class AgentExecutor:
                 raise RunNotExecutable(run_id, run.status)
             calls = ToolCallRepository(log)
             if calls.any_started(run.id):
-                raise UnfinishedToolCall(run_id, run.status)
+                raise RunNotExecutable(run_id, run.status, UNFINISHED_CALL)
             goal = _persisted_goal(run)
             call = ToolCall(
                 agent_run_id=run.id,
@@ -779,13 +762,31 @@ class AgentExecutor:
     def _fail(self, run_id: int, detail: dict[str, Any]) -> AgentRunStatus:
         with self._sessions.begin() as log:
             run = _get_run(log, run_id)
-            transition(
+            _end(
                 run,
                 AgentRunStatus.FAILED,
                 reason=OutcomeReason.UNEXPECTED_ERROR,
                 detail=detail,
             )
             return run.status
+
+
+def _end(
+    run: AgentRun,
+    status: AgentRunStatus,
+    *,
+    reason: OutcomeReason,
+    detail: dict[str, Any] | None,
+) -> None:
+    """End the run: its final status, why, and when. A run that has ended
+    stays ended. Which reason may go with which status is the agent_runs
+    outcome_matches_status CHECK constraint."""
+    if run.completed_at is not None:
+        raise RunNotExecutable(run.id, run.status, "it has already ended")
+    run.status = status
+    run.outcome_reason = reason
+    run.outcome_detail = detail
+    run.completed_at = utcnow()
 
 
 def _get_run(session: Session, run_id: int) -> AgentRun:
@@ -831,7 +832,7 @@ def _exceeded_limit(
 
 
 def _end_at_limit(run: AgentRun, limit: DecisionLimit, maximum: int) -> None:
-    transition(
+    _end(
         run,
         AgentRunStatus.FAILED,
         reason=OutcomeReason.STEP_LIMIT,
@@ -871,7 +872,7 @@ def _deny(run: AgentRun, calls: ToolCallRepository, call: ToolCall) -> None:
     call.error = error.model_dump(mode="json")
     call.completed_at = utcnow()
     calls.add(call)
-    transition(
+    _end(
         run,
         AgentRunStatus.BLOCKED,
         reason=OutcomeReason.POLICY_DENIED,
@@ -886,7 +887,7 @@ def _hold_for_approval(
     with its arguments, and pause the run."""
     call.status = ToolCallStatus.AWAITING_APPROVAL
     calls.add(call)
-    transition(run, AgentRunStatus.AWAITING_APPROVAL)
+    run.status = AgentRunStatus.AWAITING_APPROVAL
 
 
 def _blocking_rejection(attempt: ToolCall | None) -> OutcomeReason | None:

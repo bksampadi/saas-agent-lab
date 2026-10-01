@@ -53,7 +53,6 @@ from app.models import (
 )
 from app.repositories.agent_runs import AgentRunRepository
 from app.repositories.tool_calls import ToolCallRepository
-from app.schemas.agent import DecisionTask
 from support import (
     ASSIGN,
     ASSIGNMENTS,
@@ -847,13 +846,7 @@ def test_the_initial_context_is_persisted_first_id_free_and_exactly_as_sent(
     assert run.goal_type is not None
     assert run.extracted_user_email is not None
     assert run.extracted_product is not None
-    rebuilt = decision_context(
-        DecisionTask(
-            goal_type=run.goal_type,
-            user_email=run.extracted_user_email,
-            product=run.extracted_product,
-        )
-    )
+    rebuilt = decision_context(run.extracted_user_email, run.extracted_product)
     assert rebuilt.model_dump(mode="json") == run.decision_context
 
 

@@ -3,14 +3,11 @@
 from typing import get_args
 
 import pytest
-from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from app.agent.resolver import resolve_assignment_goal
-from app.models import DesiredState, GoalType, Licence, OutcomeReason, User
+from app.models import Licence, OutcomeReason, User
 from app.schemas.agent import (
-    EXTRACTED_TEXT_MAX_LENGTH,
-    ExtractedAssignmentIntent,
     ResolutionFailure,
     ResolvedAssignmentGoal,
 )
@@ -36,9 +33,7 @@ def resolve(
     session: Session, user_email: str = "ada@example.com", product: str = "Figma"
 ) -> ResolvedAssignmentGoal | ResolutionFailure:
     return resolve_assignment_goal(
-        UserService(session),
-        LicenceService(session),
-        ExtractedAssignmentIntent(user_email=user_email, product=product),
+        UserService(session), LicenceService(session), user_email, product
     )
 
 
@@ -54,36 +49,6 @@ def failure(session: Session, user_email: str, product: str) -> ResolutionFailur
     return result
 
 
-# --- the input type -------------------------------------------------------------
-
-
-def test_intent_has_only_text_fields_and_no_ids() -> None:
-    fields = ExtractedAssignmentIntent.model_fields
-
-    assert set(fields) == {"user_email", "product"}
-    for field in fields.values():
-        assert field.annotation is str
-
-
-@pytest.mark.parametrize(
-    "smuggled", ["user_id", "licence_id", "id", "resolved_user_id"]
-)
-def test_intent_rejects_any_id_field(smuggled: str) -> None:
-    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-        ExtractedAssignmentIntent.model_validate(
-            {"user_email": "ada@example.com", "product": "Figma", smuggled: 1}
-        )
-
-
-@pytest.mark.parametrize("field", ["user_email", "product"])
-def test_intent_rejects_text_beyond_the_storage_bound(field: str) -> None:
-    values = {"user_email": "ada@example.com", "product": "Figma"}
-    values[field] = "x" * (EXTRACTED_TEXT_MAX_LENGTH + 1)
-
-    with pytest.raises(ValidationError):
-        ExtractedAssignmentIntent.model_validate(values)
-
-
 # --- users: exact normalized email ----------------------------------------------
 
 
@@ -94,8 +59,6 @@ def test_exact_email_and_product_resolve_to_a_goal(session: Session) -> None:
     goal = resolved(session, "ada@example.com", "Figma")
 
     assert goal == ResolvedAssignmentGoal(
-        goal_type=GoalType.ENSURE_ASSIGNMENT,
-        desired_state=DesiredState.ASSIGNED,
         user_id=user.id,
         licence_id=licence.id,
         extracted_user_email="ada@example.com",

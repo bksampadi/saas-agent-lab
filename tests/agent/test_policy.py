@@ -24,8 +24,6 @@ from app.models import (
     AgentRunStatus,
     Assignment,
     AuditEvent,
-    DesiredState,
-    GoalType,
     Licence,
     OutcomeReason,
     PolicyDecision,
@@ -164,8 +162,6 @@ def evaluations(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
 def goal_for(licence_id: int) -> ResolvedAssignmentGoal:
     return ResolvedAssignmentGoal(
-        goal_type=GoalType.ENSURE_ASSIGNMENT,
-        desired_state=DesiredState.ASSIGNED,
         user_id=1,
         licence_id=licence_id,
         extracted_user_email="ada@example.com",

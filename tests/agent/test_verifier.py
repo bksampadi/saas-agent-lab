@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from sqlalchemy.orm import Session
 
 from app.agent.verifier import verify
-from app.models import Assignment, DesiredState, GoalType, Licence, User
+from app.models import Assignment, Licence, User
 from app.schemas.agent import ResolvedAssignmentGoal
 from app.services.assignments import AssignmentService
 
@@ -41,8 +41,6 @@ def make_assignment(
 
 def goal_for(user: User, licence: Licence) -> ResolvedAssignmentGoal:
     return ResolvedAssignmentGoal(
-        goal_type=GoalType.ENSURE_ASSIGNMENT,
-        desired_state=DesiredState.ASSIGNED,
         user_id=user.id,
         licence_id=licence.id,
         extracted_user_email=user.email,
@@ -60,7 +58,6 @@ def test_active_assignment_satisfies_the_goal(session: Session) -> None:
     assert result.satisfied is True
     evidence = result.evidence
     assert (evidence.user_id, evidence.licence_id) == (ada.id, figma.id)
-    assert evidence.desired_state is DesiredState.ASSIGNED
     assert evidence.active_assignment is not None
     assert evidence.active_assignment.assignment_id == assignment.id
     assert evidence.active_assignment.active is True

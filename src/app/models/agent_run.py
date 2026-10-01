@@ -9,6 +9,22 @@ from app.models.base import Base, UTCDateTime, enum_values, utcnow
 
 
 class AgentRunStatus(StrEnum):
+    """Where a run is. Each executor step checks the status it starts from:
+
+        RECEIVED    -> RESOLVED; or ends NEEDS_CLARIFICATION, or FAILED
+        RESOLVED    -> EXECUTING, when its decision stage starts
+        EXECUTING   -> VERIFYING, when the model concludes;
+                       AWAITING_APPROVAL, when policy holds its mutation;
+                       or ends BLOCKED (policy denied it), or FAILED
+        VERIFYING   -> ends COMPLETED, BLOCKED or FAILED
+
+    A run that has ended (completed_at is set) never changes again. Only
+    the verifier, finding the goal holding, makes a run COMPLETED, and the
+    model's proposal alone never makes one BLOCKED. Which reason goes with
+    which ending is the outcome_matches_status CHECK constraint below.
+    Nothing leaves AWAITING_APPROVAL yet.
+    """
+
     RECEIVED = "received"
     RESOLVED = "resolved"
     EXECUTING = "executing"
@@ -19,16 +35,6 @@ class AgentRunStatus(StrEnum):
     NEEDS_CLARIFICATION = "needs_clarification"
     BLOCKED = "blocked"
     FAILED = "failed"
-
-
-TERMINAL_STATUSES = frozenset(
-    {
-        AgentRunStatus.COMPLETED,
-        AgentRunStatus.NEEDS_CLARIFICATION,
-        AgentRunStatus.BLOCKED,
-        AgentRunStatus.FAILED,
-    }
-)
 
 
 class GoalType(StrEnum):
@@ -91,7 +97,7 @@ class AgentRun(Base):
     Written by the agent executor in its own short transactions, never in a
     business transaction, so the run's history survives a rolled-back change.
     The CHECK constraints keep each row internally consistent; which status
-    may follow which is enforced in code (``app.agent.status``).
+    may follow which is enforced by the executor (see AgentRunStatus).
 
     The goal columns (goal type, desired state, extracted text) are NULL
     while a natural-language instruction waits for extraction, and stay NULL
