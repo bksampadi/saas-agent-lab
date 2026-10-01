@@ -2,7 +2,6 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models import ModelCall, ModelCallStage
-from app.repositories.agent_runs import AgentRunRepository
 
 
 class ModelCallRepository:
@@ -15,18 +14,6 @@ class ModelCallRepository:
         self._session.add(call)
         self._session.flush()  # sends the INSERT so call.id is assigned
         return call
-
-    def next_sequence_no(self, agent_run_id: int) -> int:
-        """The run's next trace position, shared with its tool calls."""
-        return AgentRunRepository(self._session).next_sequence_no(agent_run_id)
-
-    def list_for_run(self, agent_run_id: int) -> list[ModelCall]:
-        statement = (
-            select(ModelCall)
-            .where(ModelCall.agent_run_id == agent_run_id)
-            .order_by(ModelCall.sequence_no)
-        )
-        return list(self._session.scalars(statement))
 
     def count_for_stage(self, agent_run_id: int, stage: ModelCallStage) -> int:
         """How many requests the run's ``stage`` has made, failed ones included."""

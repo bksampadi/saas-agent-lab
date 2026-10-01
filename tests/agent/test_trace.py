@@ -55,11 +55,10 @@ def record_model_call(sessions: Sessions, run_id: int) -> int:
     """Persist a model call the way any model stage does: in its own log
     transaction, taking the run's next sequence_no."""
     with sessions.begin() as session:
-        calls = ModelCallRepository(session)
-        call = calls.add(
+        call = ModelCallRepository(session).add(
             ModelCall(
                 agent_run_id=run_id,
-                sequence_no=calls.next_sequence_no(run_id),
+                sequence_no=AgentRunRepository(session).next_sequence_no(run_id),
                 stage=ModelCallStage.DECISION,
                 model_name="test-model",
                 status=ModelCallStatus.SUCCEEDED,

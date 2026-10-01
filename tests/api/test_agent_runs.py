@@ -64,7 +64,6 @@ from app.models import (
     User,
     UserStatus,
 )
-from app.repositories.tool_calls import ToolCallRepository
 
 HUMAN = "requesting-user@example.com"
 MODEL = "scripted-model"
@@ -677,7 +676,11 @@ def test_get_returns_the_persisted_trace_in_order_as_the_model_saw_it(
 
     with api.sessions() as session:
         run = session.get(AgentRun, created["id"])
-        calls = ToolCallRepository(session).list_for_run(created["id"])
+        calls = session.scalars(
+            select(ToolCall)
+            .where(ToolCall.agent_run_id == created["id"])
+            .order_by(ToolCall.sequence_no)
+        ).all()
     assert run is not None
     # Observations: exactly as persisted, and exactly what the model was given.
     observations = [entry["observation"] for entry in trace if "tool" in entry]

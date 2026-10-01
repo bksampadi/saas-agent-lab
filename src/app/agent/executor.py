@@ -283,11 +283,10 @@ class _ModelCallLog:
 
     def record(self, call: ModelCallRecord) -> None:
         with self._sessions.begin() as log:
-            calls = ModelCallRepository(log)
-            calls.add(
+            ModelCallRepository(log).add(
                 ModelCall(
                     agent_run_id=self._run_id,
-                    sequence_no=calls.next_sequence_no(self._run_id),
+                    sequence_no=AgentRunRepository(log).next_sequence_no(self._run_id),
                     stage=self._stage,
                     model_name=call.model_name,
                     status=(
@@ -580,9 +579,7 @@ class AgentExecutor:
             attempt = calls.latest_for_tools(run.id, tools.RECORDED_MUTATIONS)
             rejection = _blocking_rejection(attempt)
             rejection_detail = (
-                None
-                if rejection is None or attempt is None
-                else _recorded_call_detail(attempt)
+                None if rejection is None or attempt is None else _call_detail(attempt)
             )
 
         # READ: current state only. A claimed block is checked afresh, never
@@ -692,7 +689,7 @@ class AgentExecutor:
                         run,
                         AgentRunStatus.FAILED,
                         reason=OutcomeReason.TOOL_FAILED,
-                        detail=_call_detail(call, outcome),
+                        detail=_call_detail(call),
                     )
             else:
                 call.status = ToolCallStatus.SUCCEEDED
@@ -730,7 +727,7 @@ class AgentExecutor:
             goal = _persisted_goal(run)
             call = ToolCall(
                 agent_run_id=run.id,
-                sequence_no=calls.next_sequence_no(run.id),
+                sequence_no=AgentRunRepository(log).next_sequence_no(run.id),
                 tool_name=tools.RECORDED_NAMES[tool],
                 arguments=tools.arguments(tool, goal),
             )
@@ -796,16 +793,9 @@ def _get_run(session: Session, run_id: int) -> AgentRun:
     return run
 
 
-def _call_detail(call: ToolCall, error: ToolError) -> dict[str, Any]:
-    return {
-        "tool_call_id": call.id,
-        "sequence_no": call.sequence_no,
-        "tool_name": call.tool_name,
-        "error": error.model_dump(mode="json"),
-    }
-
-
-def _recorded_call_detail(call: ToolCall) -> dict[str, Any]:
+def _call_detail(call: ToolCall) -> dict[str, Any]:
+    """The run's outcome detail for a call that ended or blocked it: which
+    call, and the error recorded with it."""
     return {
         "tool_call_id": call.id,
         "sequence_no": call.sequence_no,
@@ -876,7 +866,7 @@ def _deny(run: AgentRun, calls: ToolCallRepository, call: ToolCall) -> None:
         run,
         AgentRunStatus.BLOCKED,
         reason=OutcomeReason.POLICY_DENIED,
-        detail=_call_detail(call, error),
+        detail=_call_detail(call),
     )
 
 

@@ -31,7 +31,6 @@ from app.models import (
     ToolCallStatus,
     User,
 )
-from app.repositories.tool_calls import ToolCallRepository
 from app.schemas.agent import (
     EnsureAssignmentIntent,
     ResolvedAssignmentGoal,
@@ -100,7 +99,13 @@ def get_run(sessions: Sessions, run_id: int) -> AgentRun:
 
 def tool_calls(sessions: Sessions, run_id: int) -> list[ToolCall]:
     with sessions() as session:
-        return ToolCallRepository(session).list_for_run(run_id)
+        return list(
+            session.scalars(
+                select(ToolCall)
+                .where(ToolCall.agent_run_id == run_id)
+                .order_by(ToolCall.sequence_no)
+            )
+        )
 
 
 def mutations(sessions: Sessions) -> tuple[int, int]:

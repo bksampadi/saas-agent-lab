@@ -226,7 +226,8 @@ TraceEntry = Annotated[
 
 class AgentRunDetail(_AgentRunSummary):
     """A run's summary, what its decision model was told first, what the
-    application verified at the end, and the whole trace in order.
+    application verified at the end, and the whole trace in order (``trace``
+    as AgentRunRepository.list_trace returns it, by sequence_no).
     ``decision_context`` is None if the run never reached its decision
     stage."""
 
@@ -248,7 +249,7 @@ class AgentRunDetail(_AgentRunSummary):
                 ModelCallTraceEntry.of(entry)
                 if isinstance(entry, ModelCall)
                 else ToolCallTraceEntry.of(entry)
-                for entry in sorted(trace, key=lambda entry: entry.sequence_no)
+                for entry in trace
             ],
         )
 
